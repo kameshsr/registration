@@ -135,6 +135,7 @@ public class BiometricExtractionStage extends MosipVerticleAPIManager{
 	 * Deploy verticle.
 	 */
 	public void deployVerticle() {
+		
 		mosipEventBus = this.getEventBus(this, clusterManagerUrl, workerPoolSize);
 		this.consumeAndSend(mosipEventBus, MessageBusAddress.BIOMETRIC_EXTRACTION_BUS_IN,
 				MessageBusAddress.BIOMETRIC_EXTRACTION_BUS_OUT, messageExpiryTimeLimit);
@@ -171,6 +172,8 @@ public class BiometricExtractionStage extends MosipVerticleAPIManager{
 		registrationStatusDto
 			.setLatestTransactionTypeCode(RegistrationTransactionTypeCode.BIOMETRIC_EXTRACTION.toString());
 		registrationStatusDto.setRegistrationStageName(getStageName());
+		
+		
 			if(!idrepoDraftService.idrepoHasDraft(registrationStatusDto.getRegistrationId())) {
 				registrationStatusDto.setStatusCode(RegistrationStatusCode.FAILED.toString());
 				registrationStatusDto.setLatestTransactionStatusCode(registrationStatusMapperUtil
@@ -193,11 +196,8 @@ public class BiometricExtractionStage extends MosipVerticleAPIManager{
 			else {
 				ExtractorsDto extractorsDto=getExtractors(registrationStatusDto.getRegistrationId());
 				if(extractorsDto.getExtractors()!=null && !extractorsDto.getExtractors().isEmpty()) {
-					for(ExtractorDto dto:extractorsDto.getExtractors()) {
-						addBiometricExtractiontoIdRepository(dto,registrationStatusDto.getRegistrationId());
-					}
-				}
-				else {
+					addBiometricExtractiontoIdRepository(extractorsDto.getExtractors(),registrationStatusDto.getRegistrationId());
+				} else {
 					throw new RegistrationProcessorCheckedException(PlatformErrorMessages.RPR_PMS_BIOMETRIC_EXTRACTION_NULL_RESPONSE.getCode(),
 							PlatformErrorMessages.RPR_PMS_BIOMETRIC_EXTRACTION_NULL_RESPONSE.getMessage());
 				}
@@ -345,26 +345,43 @@ public class BiometricExtractionStage extends MosipVerticleAPIManager{
 	 * @throws IdrepoDraftException
 	 *
 	 */
-	private IdResponseDTO addBiometricExtractiontoIdRepository(ExtractorDto dto,
+	private IdResponseDTO addBiometricExtractiontoIdRepository(List<ExtractorDto> dtoList,
 			String registrationId)
 			throws ApisResourceAccessException, IdrepoDraftReprocessableException, IdrepoDraftException {
-		String extractionFormat = "";
-		if(dto.getBiometric().equals("iris")) {
-			extractionFormat="irisExtractionFormat";
-		}if(dto.getBiometric().equals("face")) {
-			extractionFormat="faceExtractionFormat";
-		}if(dto.getBiometric().equals("finger")) {
-			extractionFormat="fingerExtractionFormat";
+		StringBuilder queryParmeter = new StringBuilder();
+		StringBuilder queryValue = new StringBuilder();
+
+		for(ExtractorDto dto : dtoList) {
+			String param = null;
+
+			if (dto.getBiometric().equals("iris")) {
+				param = "irisExtractionFormat";
+			} else if (dto.getBiometric().equals("face")) {
+				param = "faceExtractionFormat";
+			} else if (dto.getBiometric().equals("finger")) {
+				param = "fingerExtractionFormat";
+			}
+
+			if(param == null) continue;
+
+			if(queryParmeter.length() > 0) {
+				queryParmeter.append(",");
+				queryValue.append(",");
+			}
+
+			queryParmeter.append(param);
+			queryValue.append(dto.getAttributeName());
 		}
+
 		List<String> segments=List.of(registrationId);
-		IdResponseDTO response= (IdResponseDTO) registrationProcessorRestClientService.putApi(ApiName.IDREPOEXTRACTBIOMETRICS, segments, extractionFormat, dto.getAttributeName(), null, IdResponseDTO.class, null);
+		IdResponseDTO response= (IdResponseDTO) registrationProcessorRestClientService.putApi(ApiName.IDREPOEXTRACTBIOMETRICS, segments, queryParmeter.toString(), queryValue.toString(), null, IdResponseDTO.class, null);
+
 		if (response.getErrors() != null && !response.getErrors().isEmpty()) {
 			ErrorDTO error = response.getErrors().get(0);
 			regProcLogger.error("Error occured while updating draft for id : " + registrationId, error.toString());
 			if (response.getErrors().get(0).getErrorCode().equalsIgnoreCase(ID_REPO_KEY_MANAGER_ERROR)) {
 				throw new IdrepoDraftReprocessableException(error.getErrorCode(), error.getMessage());
 			} else {
-				idrepoDraftService.idrepoDiscardDraft(registrationId);
 				throw new IdrepoDraftException(error.getErrorCode(), error.getMessage());
 			}
         }
