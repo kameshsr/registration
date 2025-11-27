@@ -33,6 +33,7 @@ import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.HttpStatusCodeException;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
 
 import java.io.IOException;
 import java.net.URI;
@@ -96,35 +97,66 @@ public class WebApiClient {
         }
     }
 
-    /**
-     * Post api.
-     *
-     * @param <T>           the generic type
-     * @param uri           the uri
-     * @param mediaType     the mediaType
-     * @param requestType   the request type
-     * @param responseClass the response class
-     * @return the t
-     */
-    @SuppressWarnings("unchecked")
-    public <T> T postApi(String uri, MediaType mediaType, Object requestType, Class<?> responseClass) throws Exception {
+    public <T> T postApi(String uri, MediaType mediaType, Object requestBody, Class<T> responseClass) throws Exception {
 
-        T result = null;
         try {
-            return (T) webClient.post()
+            MediaType resolvedMedia = mediaType != null ? mediaType : MediaType.APPLICATION_JSON;
+
+            // Log input details
+            logger.info("POST API Request -> URI: {}, MediaType: {}, RequestBody: {}",
+                    uri, resolvedMedia, requestBody);
+
+            return webClient.post()
                     .uri(uri)
-                    .contentType(mediaType != null ? mediaType : MediaType.APPLICATION_JSON)
+                    .contentType(resolvedMedia)
                     .header(TracingConstant.TRACE_HEADER,
                             (String) ContextualData.getOrDefault(TracingConstant.TRACE_ID_KEY))
-                    .bodyValue(requestType)
+                    .bodyValue(requestBody)
                     .retrieve()
+
+                    // Handle 2xx but deserialization failure case
+                    .onStatus(HttpStatusCode::is2xxSuccessful, clientResponse ->
+                            clientResponse.bodyToMono(String.class)
+                                    .flatMap(body -> {
+                                        logger.error("200 OK but deserialization failed. Raw body: {}", body);
+                                        return Mono.error(new RuntimeException(
+                                                "WebClient 200 OK Deserialization Error. See logs."
+                                        ));
+                                    })
+                    )
+
+                    // Handle 4xx errors
+                    .onStatus(HttpStatusCode::is4xxClientError, clientResponse ->
+                            clientResponse.bodyToMono(String.class)
+                                    .flatMap(body -> {
+                                        logger.error("4xx Client Error -> Status: {}, URI: {}, Body: {}",
+                                                clientResponse.statusCode(), uri, body);
+                                        return Mono.error(new RuntimeException("4xx Error: " + body));
+                                    })
+                    )
+
+                    // Handle 5xx errors
+                    .onStatus(HttpStatusCode::is5xxServerError, clientResponse ->
+                            clientResponse.bodyToMono(String.class)
+                                    .flatMap(body -> {
+                                        logger.error("5xx Server Error -> Status: {}, URI: {}, Body: {}",
+                                                clientResponse.statusCode(), uri, body);
+                                        return Mono.error(new RuntimeException("5xx Error: " + body));
+                                    })
+                    )
+
+                    // Deserialize actual response
                     .bodyToMono(responseClass)
+                    .doOnNext(response -> {
+                        logger.info("POST API Response -> URI: {}, Response: {}", uri, response);
+                    })
                     .block(TIMEOUT);
+
         } catch (Exception e) {
-            logger.error(LoggerFileConstant.SESSIONID.toString(),
-                    LoggerFileConstant.APPLICATIONID.toString(),
-                    LoggerFileConstant.APPLICATIONID.toString(),
-                    e.getMessage() + ExceptionUtils.getStackTrace(e));
+
+            logger.error("Exception during POST API call -> URI: {}, Exception: {}",
+                    uri, ExceptionUtils.getStackTrace(e));
+
             tokenExceptionHandler(e);
             throw e;
         }
@@ -139,10 +171,9 @@ public class WebApiClient {
      * @param responseClass the response class
      * @return the t
      */
-    public <T> T postApi(String uri, Object requestType, Class<?> responseClass) throws Exception {
+    public <T> T postApi(String uri, Object requestType, Class<T> responseClass) throws Exception {
         return postApi(uri, null, requestType, responseClass);
     }
-
     /**
      * Patch api.
      *
