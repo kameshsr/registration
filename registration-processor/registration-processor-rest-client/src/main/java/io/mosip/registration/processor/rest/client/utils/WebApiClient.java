@@ -42,7 +42,7 @@ import java.util.Iterator;
 import java.util.List;
 
 /**
- * The Class RestApiClient.
+ * The Class WebApiClient.
  *
  * @author Rishabh Keshari
  */
@@ -97,66 +97,48 @@ public class WebApiClient {
         }
     }
 
-    public <T> T postApi(String uri, MediaType mediaType, Object requestBody, Class<T> responseClass) throws Exception {
+    /**
+     * Post api.
+     *
+     * @param <T>           the generic type
+     * @param uri           the uri
+     * @param mediaType     the mediaType
+     * @param requestType   the request type
+     * @param responseClass the response class
+     * @return the t
+     */
+    @SuppressWarnings("unchecked")
+    public <T> T postApi(String uri, MediaType mediaType, Object requestType, Class<?> responseClass) throws Exception {
 
+        T result = null;
         try {
-            MediaType resolvedMedia = mediaType != null ? mediaType : MediaType.APPLICATION_JSON;
-
-            // Log input details
-            logger.info("POST API Request -> URI: {}, MediaType: {}, RequestBody: {}",
-                    uri, resolvedMedia, requestBody);
-
-            return webClient.post()
+            return (T) webClient.post()
                     .uri(uri)
-                    .contentType(resolvedMedia)
+                    .contentType(mediaType != null ? mediaType : MediaType.APPLICATION_JSON)
                     .header(TracingConstant.TRACE_HEADER,
                             (String) ContextualData.getOrDefault(TracingConstant.TRACE_ID_KEY))
-                    .bodyValue(requestBody)
+                    .bodyValue(requestType)
                     .retrieve()
-
-                    // Handle 2xx but deserialization failure case
-                    .onStatus(HttpStatusCode::is2xxSuccessful, clientResponse ->
-                            clientResponse.bodyToMono(String.class)
-                                    .flatMap(body -> {
-                                        logger.error("200 OK but deserialization failed. Raw body: {}", body);
-                                        return Mono.error(new RuntimeException(
-                                                "WebClient 200 OK Deserialization Error. See logs."
-                                        ));
-                                    })
-                    )
-
-                    // Handle 4xx errors
-                    .onStatus(HttpStatusCode::is4xxClientError, clientResponse ->
-                            clientResponse.bodyToMono(String.class)
-                                    .flatMap(body -> {
-                                        logger.error("4xx Client Error -> Status: {}, URI: {}, Body: {}",
-                                                clientResponse.statusCode(), uri, body);
-                                        return Mono.error(new RuntimeException("4xx Error: " + body));
-                                    })
-                    )
-
-                    // Handle 5xx errors
-                    .onStatus(HttpStatusCode::is5xxServerError, clientResponse ->
-                            clientResponse.bodyToMono(String.class)
-                                    .flatMap(body -> {
-                                        logger.error("5xx Server Error -> Status: {}, URI: {}, Body: {}",
-                                                clientResponse.statusCode(), uri, body);
-                                        return Mono.error(new RuntimeException("5xx Error: " + body));
-                                    })
-                    )
-
-                    // Deserialize actual response
-                    .bodyToMono(responseClass)
-                    .doOnNext(response -> {
-                        logger.info("POST API Response -> URI: {}, Response: {}", uri, response);
+                    .onStatus(HttpStatusCode::is2xxSuccessful, clientResponse -> {
+                        // Log the status, headers, and body for 2xx codes (like 200 OK)
+                        // This is where you would inspect the problematic 200 response
+                        return clientResponse.bodyToMono(String.class) // Read the body as a String
+                                .flatMap(body -> {
+                                    logger.error(LoggerFileConstant.SESSIONID.toString(),
+                                            LoggerFileConstant.APPLICATIONID.toString(),
+                                            LoggerFileConstant.APPLICATIONID.toString(),
+                                            "200 OK received, but body deserialization failed. Raw Body: " + body);
+                                    // Return an error to stop processing
+                                    return Mono.error(new RuntimeException("WebClient 200 OK Deserialization Error. See logs for raw body."));
+                                });
                     })
+                    .bodyToMono(responseClass)
                     .block(TIMEOUT);
-
         } catch (Exception e) {
-
-            logger.error("Exception during POST API call -> URI: {}, Exception: {}",
-                    uri, ExceptionUtils.getStackTrace(e));
-
+            logger.error(LoggerFileConstant.SESSIONID.toString(),
+                    LoggerFileConstant.APPLICATIONID.toString(),
+                    LoggerFileConstant.APPLICATIONID.toString(),
+                    e.getMessage() + ExceptionUtils.getStackTrace(e));
             tokenExceptionHandler(e);
             throw e;
         }
@@ -171,9 +153,10 @@ public class WebApiClient {
      * @param responseClass the response class
      * @return the t
      */
-    public <T> T postApi(String uri, Object requestType, Class<T> responseClass) throws Exception {
+    public <T> T postApi(String uri, Object requestType, Class<?> responseClass) throws Exception {
         return postApi(uri, null, requestType, responseClass);
     }
+
     /**
      * Patch api.
      *
@@ -194,6 +177,19 @@ public class WebApiClient {
                             (String) ContextualData.getOrDefault(TracingConstant.TRACE_ID_KEY))
                     .bodyValue(requestType)
                     .retrieve()
+                    .onStatus(HttpStatusCode::is2xxSuccessful, clientResponse -> {
+                        // Log the status, headers, and body for 2xx codes (like 200 OK)
+                        // This is where you would inspect the problematic 200 response
+                        return clientResponse.bodyToMono(String.class) // Read the body as a String
+                                .flatMap(body -> {
+                                    logger.error(LoggerFileConstant.SESSIONID.toString(),
+                                            LoggerFileConstant.APPLICATIONID.toString(),
+                                            LoggerFileConstant.APPLICATIONID.toString(),
+                                            "200 OK received, but body deserialization failed. Raw Body: " + body);
+                                    // Return an error to stop processing
+                                    return Mono.error(new RuntimeException("WebClient 200 OK Deserialization Error. See logs for raw body."));
+                                });
+                    })
                     .bodyToMono(responseClass)
                     .block(TIMEOUT);
         } catch (Exception e) {
@@ -232,6 +228,19 @@ public class WebApiClient {
                             (String) ContextualData.getOrDefault(TracingConstant.TRACE_ID_KEY))
                     .bodyValue(requestType)
                     .retrieve()
+                    .onStatus(HttpStatusCode::is2xxSuccessful, clientResponse -> {
+                        // Log the status, headers, and body for 2xx codes (like 200 OK)
+                        // This is where you would inspect the problematic 200 response
+                        return clientResponse.bodyToMono(String.class) // Read the body as a String
+                                .flatMap(body -> {
+                                    logger.error(LoggerFileConstant.SESSIONID.toString(),
+                                            LoggerFileConstant.APPLICATIONID.toString(),
+                                            LoggerFileConstant.APPLICATIONID.toString(),
+                                            "200 OK received, but body deserialization failed. Raw Body: " + body);
+                                    // Return an error to stop processing
+                                    return Mono.error(new RuntimeException("WebClient 200 OK Deserialization Error. See logs for raw body."));
+                                });
+                    })
                     .bodyToMono(responseClass)
                     .block(TIMEOUT);
         } catch (Exception e) {
@@ -267,6 +276,19 @@ public class WebApiClient {
             return (T) webClient.delete()
                     .uri(uri)
                     .retrieve()
+                    .onStatus(HttpStatusCode::is2xxSuccessful, clientResponse -> {
+                        // Log the status, headers, and body for 2xx codes (like 200 OK)
+                        // This is where you would inspect the problematic 200 response
+                        return clientResponse.bodyToMono(String.class) // Read the body as a String
+                                .flatMap(body -> {
+                                    logger.error(LoggerFileConstant.SESSIONID.toString(),
+                                            LoggerFileConstant.APPLICATIONID.toString(),
+                                            LoggerFileConstant.APPLICATIONID.toString(),
+                                            "200 OK received, but body deserialization failed. Raw Body: " + body);
+                                    // Return an error to stop processing
+                                    return Mono.error(new RuntimeException("WebClient 200 OK Deserialization Error. See logs for raw body."));
+                                });
+                    })
                     .bodyToMono(responseType)
                     .block(TIMEOUT);
         } catch (Exception e) {
