@@ -251,8 +251,9 @@ public class PacketManagerService {
         request.setVersion(VERSION);
         request.setRequesttime(DateUtils2.getUTCCurrentDateTime());
         request.setRequest(fieldDto);
+        System.out.println("Request for meta info: " + JsonUtils.javaObjectToJsonString(request));
         ResponseWrapper<FieldResponseDto> response = (ResponseWrapper) restApi.postApi(ApiName.PACKETMANAGER_SEARCH_METAINFO, "", "", request, ResponseWrapper.class);
-
+        System.out.println("Response for meta info: " + JsonUtils.javaObjectToJsonString(response));
         if (CollectionUtils.isNotEmpty(response.getErrors())) {
             regProcLogger.error(LoggerFileConstant.SESSIONID.toString(),
                     LoggerFileConstant.REGISTRATIONID.toString(), id, JsonUtils.javaObjectToJsonString(response));
