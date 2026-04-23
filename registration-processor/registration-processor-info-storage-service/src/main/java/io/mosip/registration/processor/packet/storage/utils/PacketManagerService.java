@@ -165,8 +165,10 @@ public class PacketManagerService {
         request.setVersion(VERSION);
         request.setRequesttime(DateUtils2.getUTCCurrentDateTime());
         request.setRequest(fieldDto);
+        System.out.println("Request for packet validation: " + JsonUtils.javaObjectToJsonString(request));
+        System.out.println("API Name for packet validation: " + ApiName.PACKETMANAGER_VALIDATE.name());
         ResponseWrapper<ValidatePacketResponse> response = (ResponseWrapper) restApi.postApi(ApiName.PACKETMANAGER_VALIDATE, "", "", request, ResponseWrapper.class);
-
+        System.out.println("Response for packet validation: " + JsonUtils.javaObjectToJsonString(response));
         if (response.getErrors() != null && response.getErrors().size() > 0) {
             regProcLogger.error(LoggerFileConstant.SESSIONID.toString(), LoggerFileConstant.REGISTRATIONID.toString(), id, JsonUtils.javaObjectToJsonString(response));
             ErrorDTO errorDTO = response.getErrors().iterator().next();
