@@ -53,226 +53,470 @@ This is the full pipeline from registration-processor stages through id-reposito
 BiometricExtractionStage / FinalizationStage / UinGeneratorStage
           │
           ▼
-   HEAD /idrepository/v1/identity/draft/{id}          ← IDREPOHASDRAFT
-          │
-          │   ┌─ id-repository HTTP boundary ─────────────────────────────┐
-          │   │  IdRepoFilter (BaseIdRepoFilter)                          │
-          │   │  → logs request URL + timing only; NO crypto here         │
-          │   └───────────────────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  HEAD /idrepository/v1/identity/draft/{registrationId}              │
+  │  ← ApiName: IDREPOHASDRAFT                                          │
+  │  Input : registrationId (path param)                                │
+  │  Output: HTTP 200 (draft row exists in uin_draft)                   │
+  │          HTTP 204 (no row found)                                    │
+  │  [IdRepoFilter: logs URL + timing only — NO crypto]                 │
+  └─────────────────────────────────────────────────────────────────────┘
           │
     200? ─┼─ 204?
           │         │
           │         └─► FinalizationStage        → FAIL (no draft)
           │         └─► BiometricExtractionStage → FAIL (no draft)
           │         └─► UinGeneratorStage
-          │               └─► POST /draft/create/{id}     ← IDREPOCREATEDRAFT
-          │               │       │
-          │               │       ▼ [id-repository: IdRepoDraftServiceImpl.createDraft()]
-          │               │   uinDraftRepo.save(newDraft)
-          │               │       │
-          │               │       │  ◄── IdRepoEntityInterceptor.onSave()
-          │               │       │       encrypt uinData  (AES via securityManager.encrypt, uinDataRefId)
-          │               │       │       encrypt uin      (AES+Salt via securityManager.encryptWithSalt)
-          │               │       ▼
-          │               │   [uin_draft table — stored encrypted at rest]
-          │               │
-          │               └─► PATCH /draft/update/{id}    ← IDREPOUPDATEDRAFT
-          │                       │
-          │                       ▼ [updateDraft()]
-          │                   uinDraftRepo.findByRegId(regId)
-          │                       │
-          │                       │  ◄── IdRepoEntityInterceptor.onLoad()
-          │                       │       decrypt uinData (AES)
-          │                       │       verify SHA-256(decrypted) == uinDataHash
-          │                       │       → throws IDENTITY_HASH_MISMATCH if tampered
-          │                       ▼
-          │                   [UinDraft entity — plain text in service layer]
-          │                   JSONCompare diff → merge demographics
-          │                   S3 upload new docs
-          │                   uinDraftRepo.save(draft)
-          │                       │
-          │                       │  ◄── IdRepoEntityInterceptor.onFlushDirty()
-          │                       │       re-encrypt uinData + uin before DB flush
-          │                       ▼
-          │                   [uin_draft table — re-encrypted on UPDATE]
+          │
+          │  ┌── 204 path: draft does NOT exist ─────────────────────────┐
+          │  │                                                            │
+          │  │  POST /idrepository/v1/identity/draft/create/{regId}      │
+          │  │  ← ApiName: IDREPOCREATEDRAFT                             │
+          │  │  Input : registrationId (path)                            │
+          │  │          UIN (optional query param — for update/correction)│
+          │  │  Body  : none                                             │
+          │  │                                                            │
+          │  │  [IdRepoDraftServiceImpl.createDraft()]                   │
+          │  │  If UIN given (update/correction flow):                   │
+          │  │    uinRepo.findByUinHash(uinHash) → clone existing Uin   │
+          │  │    → mapper.convertValue(uin → UinDraft)                  │
+          │  │  If NO UIN (new registration):                            │
+          │  │    GET ${mosip.kernel.idgenerator.url}/v1/idgenerator/uin │
+          │  │    ← RestServicesConstants.UIN_GENERATOR_SERVICE          │
+          │  │    @Transactional(NOT_SUPPORTED) — releases DB conn       │
+          │  │    → receives new UIN string                              │
+          │  │    → generateIdentityObject: {"identity":{"UIN":"..."}}   │
+          │  │                                                            │
+          │  │  uinDraftRepo.save(newDraft)                              │
+          │  │    ◄── IdRepoEntityInterceptor.onSave()                   │
+          │  │        encrypt uinData (AES, uinDataRefId)                │
+          │  │        encrypt uin    (AES+Salt)                          │
+          │  │    → [uin_draft table — stored encrypted]                 │
+          │  │                                                            │
+          │  │  Response: IdResponseDTO                                  │
+          │  │    { id, version, responsetime,                           │
+          │  │      response: { status: "DRAFTED",                       │
+          │  │                  identity: {UIN, ...},                    │
+          │  │                  documents: [] } }                        │
+          │  └────────────────────────────────────────────────────────────┘
+          │
+          │  ┌── 200 path: draft EXISTS ──────────────────────────────────┐
+          │  │                                                            │
+          │  │  GET /idrepository/v1/identity/draft/{regId}              │
+          │  │  ← ApiName: IDREPOGETDRAFT                                │
+          │  │  Input : registrationId (path)                            │
+          │  │          fingerExtractionFormat (optional query)          │
+          │  │          irisExtractionFormat   (optional query)          │
+          │  │          faceExtractionFormat   (optional query)          │
+          │  │                                                            │
+          │  │  [IdRepoDraftServiceImpl.getDraft()]                      │
+          │  │  uinDraftRepo.findByRegId(regId)                          │
+          │  │    ◄── IdRepoEntityInterceptor.onLoad()                   │
+          │  │        decrypt uinData; verify SHA-256 hash               │
+          │  │  For each UinBiometricDraft:                               │
+          │  │    S3.getBiometricObject(uinHash, bioFileId)              │
+          │  │    → raw CBEFF bytes                                       │
+          │  │    proxyService.getBiometricsForRequestedFormats()         │
+          │  │    → extracted bytes (if formats requested)               │
+          │  │  For each UinDocumentDraft:                               │
+          │  │    S3.getDemographicObject(uinHash, docId) → doc bytes    │
+          │  │                                                            │
+          │  │  Response: IdResponseDTO                                  │
+          │  │    { response: { status: "DRAFTED",                       │
+          │  │                  identity: { UIN, fullName, dob, ... },   │
+          │  │                  documents: [{ category, value(base64) }],│
+          │  │                  verifiedAttributes: [...] } }            │
+          │  │                                                            │
+          │  │  DraftSvc: merges existing UIN into new idRequestDto      │
+          │  └────────────────────────────────────────────────────────────┘
+          │
+          │  PATCH /idrepository/v1/identity/draft/update/{regId}
+          │  ← ApiName: IDREPOUPDATEDRAFT
+          │  Input : registrationId (path)
+          │  Body  : IdRequestDTO →
+          │    { id, version, requesttime,
+          │      request: { registrationId,
+          │                 status: "ACTIVATED" | "DEACTIVATED",
+          │                 identity: { UIN, fullName, dateOfBirth,
+          │                             gender, phone, email,
+          │                             individualBiometrics: {
+          │                               format, version, value(base64-CBEFF) },
+          │                             ... (all demographic fields) },
+          │                 documents: [{ category: "individualBiometrics",
+          │                               value: "<base64 bytes>" },
+          │                             { category: "proofOfAddress",
+          │                               value: "<base64 bytes>" }, ...],
+          │                 verifiedAttributes: ["phone","email",...] } }
+          │
+          │  [IdRepoDraftServiceImpl.updateDraft()]
+          │  uinDraftRepo.findByRegId(regId)
+          │    ◄── IdRepoEntityInterceptor.onLoad() — decrypt + hash-verify
+          │
+          │  If first update (uinData is null):
+          │    set identity bytes directly from request
+          │    S3.storeDemographicObject / storeBiometricObject per doc
+          │  If subsequent update (uinData exists):
+          │    JSONCompare.compareJSON(existing, incoming, LENIENT)
+          │    → diff: identify changed/added/removed fields
+          │    merge changed fields into existing identity JSON
+          │    S3.storeDemographicObject for changed documents
+          │    updateBiometricAndDocumentDrafts() — sync UinBiometricDraft list
+          │
+          │  uinDraftRepo.save(draft)
+          │    ◄── IdRepoEntityInterceptor.onFlushDirty()
+          │        re-encrypt uinData + uin before DB flush
+          │    → [uin_draft table — re-encrypted]
+          │
+          │  Response: IdResponseDTO
+          │    { response: { status: "DRAFTED", identity: {...} } }
+          │
+          │  On error:
+          │    DELETE /draft/discard/{regId}  ← IDREPODISCARDDRAFT
+          │    Input : registrationId (path), no body
+          │    Action: uinDraftRepo.deleteByRegId(regId) → row deleted
+          │    Response: IdResponseDTO { response: { status: "DISCARDED" } }
+          │    throws IdrepoDraftException / IdrepoDraftReprocessableException
           │
           └─► BiometricExtractionStage
-          │     └─► PUT /draft/extractbiometrics/{id}
-          │             │
-          │             ▼ [extractBiometrics() — @Transactional(NOT_SUPPORTED)]
-          │         uinDraftRepo.findByRegId(regId)
-          │             │  ◄── IdRepoEntityInterceptor.onLoad() (decrypt, hash-verify)
-          │             ▼
-          │         S3.getBiometricObject() → raw CBEFF bytes
-          │         proxyService.getBiometricsForRequestedFormats()
-          │         S3.store(extracted result)
+          │
+          │  PUT /idrepository/v1/identity/draft/extractbiometrics/{regId}
+          │  ← ApiName: EXTRACTBIOMETRICS
+          │  Input : registrationId (path)
+          │          fingerExtractionFormat = e.g. "ISO_19794_4_2011" (query)
+          │          irisExtractionFormat   = e.g. "ISO_19794_6_2011" (query)
+          │          faceExtractionFormat   = e.g. "ISO_19794_5_2011" (query)
+          │  (formats come from partner's extractor config via PMS API)
+          │
+          │  [IdRepoDraftServiceImpl.extractBiometrics()]
+          │  @Transactional(NOT_SUPPORTED) — releases DB conn before S3 I/O
+          │  uinDraftRepo.findByRegId(regId)
+          │    ◄── IdRepoEntityInterceptor.onLoad() — decrypt + hash-verify
+          │
+          │  For each UinBiometricDraft entry (e.g. individualBiometrics):
+          │    uinHash = draft.uinHash.split("_")[1]
+          │
+          │    S3 DELETE (stale extraction cleanup, non-fatal):
+          │      bucket/{uinHash}/{bioFileId_noExt}.finger.ISO_19794_4_2011
+          │      bucket/{uinHash}/{bioFileId_noExt}.iris.ISO_19794_6_2011
+          │      bucket/{uinHash}/{bioFileId_noExt}.face.ISO_19794_5_2011
+          │
+          │    S3 READ (raw source):
+          │      bucket/{uinHash}/{bioFileId}   e.g. individualBiometrics.xml
+          │      → returns raw CBEFF bytes
+          │
+          │    BioSDK extraction:
+          │      POST ${mosip.mock.biosdk.url}/biosdk-service/{extractionFormat}/extracttemplates
+          │      → proxyService.getBiometricsForRequestedFormats(uinHash, bioFileId, formats, cbeff)
+          │      → returns extracted template bytes per modality
+          │
+          │    S3 WRITE (new extracted files):
+          │      bucket/{uinHash}/{bioFileId_noExt}.finger.ISO_19794_4_2011
+          │      bucket/{uinHash}/{bioFileId_noExt}.iris.ISO_19794_6_2011
+          │      bucket/{uinHash}/{bioFileId_noExt}.face.ISO_19794_5_2011
+          │
+          │  Response: IdResponseDTO { response: { status: "DRAFTED" } }
+          │
+          │  On extraction error:
+          │    BiometricExtractionStage calls discardDraft → packet = FAILED
           │
           └─► FinalizationStage
-                └─► GET /draft/publish/{id}               ← IDREPOPUBLISHDRAFT
-                      │
-                      ▼ [publishDraft()]
-                  uinDraftRepo.findByRegId(regId)
-                      │  ◄── IdRepoEntityInterceptor.onLoad() (decrypt, hash-verify)
-                      ▼
-                  securityManager.decryptWithSalt(encryptedUin, salt)
-                  → plain UIN string for addIdentity/updateIdentity
+          │
+          │  GET /idrepository/v1/identity/draft/publish/{registrationId}
+          │  ← ApiName: IDREPOPUBLISHDRAFT
+          │  Input : registrationId (path), no body
+          │
+          │  [IdRepoDraftServiceImpl.publishDraft()]
+          │  uinDraftRepo.findByRegId(regId)
+          │    ◄── IdRepoEntityInterceptor.onLoad() — decrypt + hash-verify
+          │
+          │  buildRequest(regId, draft) → IdRequestDTO (parses uinData JSON)
+          │  validateRequest(request)
+          │  uinEncryptSaltRepo.getOne(saltId) → salt
+          │  securityManager.decryptWithSalt(encryptedUin, salt) → plain UIN
+          │
+          │  uinRepo.existsByUinHash(draft.uinHash) → true/false
+          │
+          ├── New Identity (UIN not yet live) ──────────────────────────────┐
+          │                                                                 │
+          │   ① VidDraftHelper.generateDraftVid(uin)                       │
+          │     Only if: mosip.idrepo.draft-vid.default-type-to-create set  │
+          │     (default: PERPETUAL)                                        │
+          │                                                                 │
+          │     POST ${mosip.idrepo.vid.url}/idrepository/v1/draft/vid      │
+          │     ← RestServicesConstants.VID_DRAFT_GENERATOR_SERVICE         │
+          │     Config key: mosip.idrepo.draft-vid.rest.uri                 │
+          │     @Transactional(NOT_SUPPORTED) — releases DB conn            │
+          │                                                                 │
+          │     Request body (RequestWrapper<VidRequestDTO>):               │
+          │       { "id": "mosip.vid.create",                               │
+          │         "version": "v1",                                        │
+          │         "requesttime": "<UTC datetime>",                        │
+          │         "request": { "uin": "<plain UIN>",                      │
+          │                      "vidType": "PERPETUAL" } }                 │
+          │                                                                 │
+          │     [VID Service: VidController.createDraftVid()]               │
+          │     → sets vidStatus = "DRAFT"                                  │
+          │     → calls createVid() → saves new Vid row                     │
+          │     ◄── IdRepoVidEntityInterceptor.onSave()                     │
+          │         encrypt vid + vidData columns                           │
+          │                                                                 │
+          │     Response (ResponseWrapper<Map<String,String>>):             │
+          │       { "response": { "VID": "1234567890123456" } }             │
+          │     → draftVid = response.get("VID")                           │
+          │                                                                 │
+          │   ② super.addIdentity(idRequest, uin)                          │
+          │     → INSERT into uin table                                     │
+          │     ◄── IdRepoEntityInterceptor.onSave()                        │
+          │         encrypt uinData (AES) + uin (AES+Salt) before INSERT    │
+          │     → S3: store identity documents + biometrics                 │
+          │     → INSERT into uin_history                                   │
+          │                                                                 │
+          │   ③ VidDraftHelper.activateDraftVid(draftVid)                  │
+          │     Only if draftVid != null                                    │
+          │                                                                 │
+          │     PATCH ${mosip.idrepo.vid.url}/idrepository/v1/vid/{vid}     │
+          │     ← RestServicesConstants.VID_UPDATE_SERVICE                  │
+          │     Config key: mosip.idrepo.update-vid.rest.uri                │
+          │     URI: uri.replace("{vid}", draftVid)                         │
+          │                                                                 │
+          │     Request body (RequestWrapper<VidRequestDTO>):               │
+          │       { "id": "mosip.vid.update",                               │
+          │         "version": "v1",                                        │
+          │         "requesttime": "<UTC datetime>",                        │
+          │         "request": { "vidStatus": "ACTIVE" } }                  │
+          │     Config: mosip.idrepo.vid.active-status=ACTIVE               │
+          │                                                                 │
+          │     [VID Service: VidController.updateVid()]                    │
+          │     → changes vidStatus DRAFT → ACTIVE in vid table             │
+          │     ◄── IdRepoVidEntityInterceptor.onFlushDirty()               │
+          │         re-encrypt vid + vidData on UPDATE                      │
+          │                                                                 │
+          │     Response: ResponseWrapper<VidResponseDTO>                   │
+          │       { "response": { "VID": "...", "vidStatus": "ACTIVE" } }   │
+          └─────────────────────────────────────────────────────────────────┘
+          │
+          ├── Existing Identity (update/correction) ──────────────────────┐
+          │   super.updateIdentity(idRequest, uin)                        │
+          │   → UPDATE uin table                                           │
+          │   ◄── IdRepoEntityInterceptor.onFlushDirty()                  │
+          │       re-encrypt uinData + uin on UPDATE                      │
+          │   → INSERT uin_history row                                     │
+          │   → S3: update changed documents / biometrics                 │
+          └────────────────────────────────────────────────────────────────┘
 
-                  ┌── New Identity ────────────────────────────────────────┐
-                  │  vidDraftHelper.generateDraftVid(uin)                  │
-                  │  super.addIdentity()                                   │
-                  │  uinRepo.save(newUin)                                  │
-                  │    │  ◄── IdRepoEntityInterceptor.onSave()             │
-                  │    │       encrypt uinData + uin before INSERT         │
-                  │    ▼                                                   │
-                  │  [uin table — stored encrypted]                        │
-                  │  vidDraftHelper.activateDraftVid(draftVid)             │
-                  └────────────────────────────────────────────────────────┘
-                  ┌── Existing Identity ───────────────────────────────────┐
-                  │  super.updateIdentity()                                │
-                  │  uinRepo.save(updatedUin)                              │
-                  │    │  ◄── IdRepoEntityInterceptor.onFlushDirty()       │
-                  │    │       re-encrypt uinData + uin on UPDATE          │
-                  │    ▼                                                   │
-                  │  [uin table — re-encrypted]                            │
-                  └────────────────────────────────────────────────────────┘
+          anonymousProfileHelper.buildAndsaveProfile(true)
+          publishDocuments(draft, uinObject)
+          → uinBiometricRepo.saveAll(biometrics from draft)
+          → uinDocumentRepo.saveAll(documents from draft)
+          uinDraftRepo.deleteByRegId(regId) → draft row removed
 
-                  notify() → WebSub
-                  └─► publish IDENTITY_CREATED / IDENTITY_UPDATED topic
+          Response: IdResponseDTO
+            { response: { status: "ACTIVATED" | "DEACTIVATED",
+                          identity: { UIN, fullName, ... },
+                          documents: [...] } }
 
-                  issueCredential()
-                  └─► writes row → credential_request_status (status = NEW)
+          notify() → IdRepoProxyServiceImpl.sendGenericIdentityEvents()
+          └─► publish IDENTITY_CREATED or IDENTITY_UPDATED
+              topic: {partnerId}/IDENTITY_CREATED (or IDENTITY_UPDATED)
+              via WebSub publisher at ${mosip.websub.url}/hub/
+
+          issueCredential()
+          └─► For each partner: creates CredentialRequestStatus entity
+                  { credentialId (UUID), partnerId, statusCode: "NEW",
+                    request: <credential request JSON> }
+              credRequestRepo.save(entity)
+                ◄── CredentialTransactionInterceptor.onSave()
+                    Base64URLSafe(requestBytes) → cryptoUtil.encryptData()
+                    stores encrypted request field
+              → [credential_request_status — request column encrypted at rest]
+
                         │
-                        │  ◄── CredentialTransactionInterceptor.onSave()
-                        │       Base64URLSafe(requestBytes) → cryptoUtil.encryptData()
-                        │       stores encrypted `request` field in DB
-                        ▼
-                  [credential_request_status — request column encrypted at rest]
+                        ▼  @Scheduled: fixedDelay=${mosip.idrepo.credential.status.job.delay:1000}ms
+              CredentialStatusManager.triggerEventNotifications()
+              SELECT * FROM credential_request_status WHERE status='NEW'
+                ◄── CredentialTransactionInterceptor.onLoad()
+                    cryptoUtil.decryptData() + Base64URLSafe decode
+                    (falls back to raw value if decrypt fails — backward compat)
 
-                        │
-                        ▼  @Scheduled job (identity-service CredentialStatusManager)
-              reads credential_request_status WHERE status = NEW
-                        │
-                        │  ◄── CredentialTransactionInterceptor.onLoad()
-                        │       cryptoUtil.decryptData() → Base64URLSafe decode
-                        │       (falls back to raw if decrypt fails — backward compat)
-                        ▼
-              POST /credentialrequest/{partnerId}   → Credential Request Generator
+              POST ${mosip.idrepo.credrequest.generator.url}/v1/credentialrequest/requestgenerator
+              ← mosip.idrepo.credential.request.rest.uri
+              Body: { credentialType, protectionKey, encrypt: true,
+                      sharableAttributes: [...], user: partnerId,
+                      additionalData: { UIN, RID, ... } }
 
                         │
                         ▼ [credential-request-generator]
-              saves credential_transaction (status = NEW)
-                        │  ◄── CredentialTransactionInterceptor.onSave() (same pattern)
-                        ▼
-              [credential_transaction — request column encrypted]
+              Saves CredentialEntity (credential_transaction) status=NEW
+                ◄── CredentialTransactionInterceptor.onSave() (same pattern)
+              → [credential_transaction — request column encrypted]
 
                         │
                         ▼  @Scheduled Spring Batch — CredentialProcessJob
-              POST /credentialservice/issue         → Credential Service
+              POST /v1/credentialservice/generate → Credential Service
+              Body: { credentialType, id, issuer, encrypt, encryptionKey,
+                      sharableAttributes, additionalData }
 
                         │
                         ▼ [credential-service]
-              POST /datashare/create                → Data Share Service
-              └─► returns dataShareUri
+              POST /v1/dataShare/create → Data Share Service
+              → returns dataShareUri (bundled demographics + biometrics JSON)
 
-              publish CREDENTIAL_ISSUED event       → WebSub Hub
+              publish CREDENTIAL_ISSUED event → WebSub Hub
               topic: {partnerId}/CREDENTIAL_ISSUED
+              payload: EventModel { publisher, publishedOn,
+                event: { id(UUID), transactionId,
+                         type: { namespace, name },
+                         data: { dataShareUri, MODULO, SALT,
+                                 demoEncryptedRandomKey,
+                                 bioEncryptedRandomKey,
+                                 idHash, transactionLimit, expiryTime,
+                                 tokenId } } }
 
   ══════════════════════════════════════════════════════════════════════
   IDA (id-authentication) — SUBSCRIBED to {partnerId}/CREDENTIAL_ISSUED
   ══════════════════════════════════════════════════════════════════════
 
   IdChangeEventHandlerServiceImpl.handleCredentialIssued()
-  └─► credentialStoreService.storeEventModel()
-        └─► saves → credential_event_store (status = NEW)
+  └─► credentialStoreService.storeEventModel(eventModel)
+        → INSERT into credential_event_store
+          { id, credentialTransactionId, requestId, status: "NEW",
+            eventModel(JSON), createDTimes }
 
                         │
-                        ▼  @Scheduled Spring Batch — CredentialStoreJob
+                        ▼  @Scheduled: fixedDelay=${ida.batch.credential.store.job.delay:1000}ms
               CredentialStoreTasklet.execute()
               credentialEventRepo.findNewOrFailedEvents(pageSize=100)
-              ForkJoinPool (threads: ida.batch.credential.store.thread.count)
+              ForkJoinPool (threads: ida.batch.credential.store.thread.count=10)
 
                         │ per event:
                         ▼ CredentialStoreServiceImpl.doProcessCredentialStoreEvent()
-              parse EventModel
-              extract dataShareUri + demoEncryptedRandomKey + bioEncryptedRandomKey
-              saveSalt() → ida_uin_hash_salt table
-              securityManager.reEncryptAndStoreRandomKey() → re-encrypt under IDA KMS
-              dataShareManager.downloadObject(dataShareUri) → fetch credential JSON
 
-              createIdentityEntity()
-              ├─► splitDemoBioData() — separate demographic vs biometric keys
-              ├─► identityCacheRepo.findById(idHash) — INSERT or UPDATE
-              │     ├─► demographicData (stored in identity_cache)
-              │     └─► biometricData  (stored in identity_cache)
-              └─► storeIdentityEntity()
-                    └─► identityCacheRepo.save() → DB
+              parse EventModel from credential_event_store.eventModel JSON
+              extract from event.data:
+                dataShareUri, MODULO, SALT,
+                demoEncryptedRandomKey (RSA-encrypted AES key for demographics),
+                bioEncryptedRandomKey  (RSA-encrypted AES key for biometrics),
+                idHash, transactionLimit, expiryTimestamp, tokenId
 
-              updateEventProcessingStatus()
+              saveSalt(idHash, MODULO, SALT) → ida_uin_hash_salt table
+
+              securityManager.reEncryptAndStoreRandomKey(idHash,
+                demoEncryptedRandomKey, bioEncryptedRandomKey)
+              → re-encrypts random keys under IDA's own KMS (key rotation)
+
+              GET {dataShareUri} → Data Share Service
+              → downloads credential JSON:
+                { demographics: { fullName, dob, gender, phone, ... },
+                  biometrics:   { finger_Left_Thumb: <base64>,
+                                  iris_Left: <base64>,
+                                  face: <base64>, ... } }
+
+              createIdentityEntity(idHash, credentialData, ...)
+              ├─► splitDemoBioData(): keys starting with finger/iris/face → bio
+              │                       all other keys → demographics
+              ├─► identityCacheRepo.findById(idHash) → INSERT or UPDATE
+              │     { idHash, demographicData(bytes),
+              │       biometricData(bytes), expiryTimestamp,
+              │       transactionLimit, tokenId, updatedDTimes }
+              └─► storeIdentityEntity() → identityCacheRepo.save()
+
+              updateEventProcessingStatus(success=true)
               ├─► credential_event_store → status = STORED
               └─► CredentialStoreStatusEventPublisher.publishEvent()
+                    topic: ida-topic-credential-status-update
+                    payload: { requestId, status: "STORED",
+                               updatedDTimes: <UTC datetime> }
+
                         │
-                        ▼
-              publish CREDENTIAL_STATUS_UPDATE event → WebSub Hub
-              topic: ida-topic-credential-status-update
-              payload: { requestId, status: "STORED", timestamp }
+                        ▼  WebSub → credential-request-generator
+              Updates credential_transaction → status = STORED
 
   ══════════════════════════════════════════════════════════════════════
   IDA Auth Request — HTTP Filter Chain (how auth is decrypted)
   ══════════════════════════════════════════════════════════════════════
 
-  Partner sends: POST /auth/{mispLK}/{partnerId}/{apiKey}
-  Headers: signature (JWS of full body)
-  Body:    { id, version, requestSessionKey(RSA-encrypted), requestHMAC, thumbprint,
-             request(AES-encrypted+base64), biometrics[](AES-GCM per BDB) }
+  Partner sends: POST /idauthentication/v1/auth/{mispLK}/{partnerId}/{apiKey}
+  Headers: signature: <JWS of full request body>
+  Body:
+    { "id": "mosip.identity.auth",
+      "version": "1.0",
+      "requesttime": "<UTC datetime>",
+      "individualId": "<VID or UIN>",
+      "individualIdType": "VID",
+      "transactionID": "<txnId>",
+      "thumbprint": "<SHA256 hex of partner cert>",
+      "requestSessionKey": "<Base64URL(RSA-encrypted AES session key)>",
+      "requestHMAC": "<Base64URL(AES-encrypted SHA256 HMAC of request)>",
+      "request": "<Base64URL(AES-CBC encrypted JSON of auth data)>"
+                  decrypted request contains:
+                  { "demographics": { "fullName": [...], "dob": "..." },
+                    "biometrics": [{ "data": "<JWS>",
+                                     "hash": "<chained SHA256>",
+                                     "sessionKey": "<Base64URL(encrypted)>",
+                                     "thumbprint": "..." }] } }
                         │
   [BaseIDAFilter]       ▼
-              validate `id` field + `version` format
+              validate "id" field == mosip.identity.auth (config)
+              validate "version" matches regex pattern
                         │
   [BaseAuthFilter]      ▼
               authenticateRequest()
-              └─► keyManager.verifySignature(signature header)
-                  validates RSA cert trust chain of partner
-
+              └─► keyManager.verifySignature(signature header JWS)
+                  → validates partner cert trust chain
+                        │
   [IdAuthFilter]        ▼
               decipherRequest()
-              ├─► decode(requestSessionKey) → encryptedSessionKey bytes
+              ├─► Base64URL-decode(requestSessionKey) → encryptedSessionKey bytes
               ├─► keyManager.kernelDecryptAndDecode(
-              │     thumbprint, encryptedSessionKey, encryptedHMAC, IDA_refId)
-              │   → RSA-decrypts session key using IDA private key
-              │   → AES-decrypts HMAC, validates payload integrity
+              │     thumbprint, encryptedSessionKey, encryptedHMAC,
+              │     refId = ${mosip.ida.auth.partner.id})
+              │   → RSA-OAEP decrypts session key with IDA private key
+              │   → AES-CBC decrypts HMAC bytes
+              │   → returns plain HMAC string
               │
-              ├─► keyManager.requestData()
-              │   → AES-decrypts `request` field using session key
-              │   → verifies HMAC of decrypted payload
+              ├─► keyManager.requestData(requestBody, ...)
+              │   → AES-CBC decrypts `request` field using session key
+              │   → recomputes SHA256 HMAC, validates == decrypted HMAC
+              │   → returns decrypted { demographics, biometrics } map
               │
               └─► decipherBioData() [per biometric segment]
-                    decode JWS data → verify digitalId signature
-                    salt = Base64(XOR(timestamp, txnId)[-2 bytes])
-                    aad  = Base64(XOR(timestamp, txnId)[-3 bytes])
-                    keyManager.kernelDecrypt(thumbprint, encBioSessionKey,
-                      encBioValue, BIO_refId, aad, salt)
-                    → AES-GCM decrypts each Biometric Data Block (BDB)
+                    extract JWS payload (base64url middle part)
+                    verify digitalId JWS signature (device cert)
+                    parse data: { bioType, bioValue(encrypted), timestamp, transactionId }
+                    salt = Base64(XOR(timestamp, txnId)[last 2 bytes])
+                    aad  = Base64(XOR(timestamp, txnId)[last 3 bytes])
+                    keyManager.kernelDecrypt(
+                      thumbprint, encBioSessionKey, encBioValue,
+                      refId = ${mosip.ida.auth.partner.bio.id}, aad, salt)
+                    → AES-GCM decrypts BDB (Biometric Data Block)
+                    → replaces bioValue with decrypted CBEFF bytes
                         │
   [IdAuthFilter]        ▼
               validateDecipheredRequest()
-              └─► partnerService.validateAndGetPolicy(partnerId)
-                  checkMispPolicyAllowed()
-                  checkAllowedAuthTypeBasedOnPolicy()  (demo/bio/otp/pin)
-                  addMetadata(partnerId, partnerPolicy) to request
+              └─► partnerService.validateAndGetPolicy(partnerId, apiKey, mispLK)
+                  checkMispPolicyAllowed(mispPolicy)
+                  checkAllowedAuthTypeBasedOnPolicy(authPolicies, requestBody)
+                  checkMandatoryAuthTypeBasedOnPolicy(mandatoryPolicies)
+                  addMetadata(partnerId, partnerPolicy) to request map
                         │
                         ▼
-              Spring AuthController (receives plain-text decrypted request)
-              └─► fetch identity from identity_cache by idHash
-              └─► run auth match (demographic / biometric / OTP)
+              Spring AuthController (receives fully decrypted request map)
+              └─► fetch identity from identity_cache WHERE idHash = hash(individualId)
+              └─► run match: demographics / biometric BDB comparison / OTP
+              └─► build auth response { authStatus: true/false, ... }
                         │
   [BaseIDAFilter]       ▼
               consumeResponse()
               └─► keyManager.signResponse(responseAsString)
-                  → signs response with IDA private key (JWS)
-                  → sets `response-signature` HTTP header
+                  → JWS-signs full response JSON with IDA private key
+                  → sets response header: ${mosip.sign.response.header}
+              storeAuthTransaction() if needStoreAuthTransaction()
+              storeAnonymousProfile() if needStoreAnonymousProfile()
                         │
                         ▼
-  Partner receives: JSON body (plain) + response-signature header (JWS)
+  Partner receives:
+    Body   : { "id": "...", "response": { "authStatus": true }, "errors": [] }
+    Header : response-signature: <JWS>
 ```
 
 ---
