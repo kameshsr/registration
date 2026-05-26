@@ -81,7 +81,7 @@ BiometricExtractionStage / FinalizationStage / UinGeneratorStage
           │  │    uinRepo.findByUinHash(uinHash) → clone existing Uin   │
           │  │    → mapper.convertValue(uin → UinDraft)                  │
           │  │  If NO UIN (new registration):                            │
-          │  │    GET ${mosip.kernel.idgenerator.url}/v1/idgenerator/uin │
+          │  │    GET http://idgenerator.kernel/v1/idgenerator/uin │
           │  │    ← RestServicesConstants.UIN_GENERATOR_SERVICE          │
           │  │    @Transactional(NOT_SUPPORTED) — releases DB conn       │
           │  │    → receives new UIN string                              │
@@ -89,8 +89,13 @@ BiometricExtractionStage / FinalizationStage / UinGeneratorStage
           │  │                                                            │
           │  │  uinDraftRepo.save(newDraft)                              │
           │  │    ◄── IdRepoEntityInterceptor.onSave()                   │
-          │  │        encrypt uinData (AES, uinDataRefId)                │
-          │  │        encrypt uin    (AES+Salt)                          │
+          │  │        → POST ${mosip.kernel.keymanager.url}              │
+          │  │               /v1/keymanager/encrypt  (x2: uinData + uin) │
+          │  │          uinData: {appId, refId:uinDataRefId,             │
+          │  │                    data:urlSafeBase64(uinDataBytes)}       │
+          │  │          uin:     {appId, refId:uinRefId,                 │
+          │  │                    data:urlSafeBase64(uin+salt bytes)}     │
+          │  │          Resp:    {response:{data:"<AES-encrypted-b64>"}} │
           │  │    → [uin_draft table — stored encrypted]                 │
           │  │                                                            │
           │  │  Response: IdResponseDTO                                  │
@@ -112,7 +117,12 @@ BiometricExtractionStage / FinalizationStage / UinGeneratorStage
           │  │  [IdRepoDraftServiceImpl.getDraft()]                      │
           │  │  uinDraftRepo.findByRegId(regId)                          │
           │  │    ◄── IdRepoEntityInterceptor.onLoad()                   │
-          │  │        decrypt uinData; verify SHA-256 hash               │
+          │  │        → POST ${mosip.kernel.keymanager.url}              │
+          │  │               /v1/keymanager/decrypt                      │
+          │  │          {appId, refId:uinDataRefId, data:"<encrypted>"}  │
+          │  │          Resp: {response:{data:"<decrypted-urlSafeB64>"}} │
+          │  │        hash-verify: HMACUtils2.digestAsPlainText() LOCAL  │
+          │  │        (no external call for SHA-256 — local HMAC only)   │
           │  │  For each UinBiometricDraft:                               │
           │  │    S3.getBiometricObject(uinHash, bioFileId)              │
           │  │    → raw CBEFF bytes                                       │
@@ -150,7 +160,11 @@ BiometricExtractionStage / FinalizationStage / UinGeneratorStage
           │
           │  [IdRepoDraftServiceImpl.updateDraft()]
           │  uinDraftRepo.findByRegId(regId)
-          │    ◄── IdRepoEntityInterceptor.onLoad() — decrypt + hash-verify
+          │    ◄── IdRepoEntityInterceptor.onLoad()
+          │        → POST ${mosip.kernel.keymanager.url}/v1/keymanager/decrypt
+          │          Req : {appId, refId:uinDataRefId, data:"<AES-encrypted-b64>"}
+          │          Resp: {response:{data:"<decrypted-urlSafeBase64>"}}
+          │        hash-verify: HMACUtils2.digestAsPlainTextWithSalt() LOCAL
           │
           │  If first update (uinData is null):
           │    set identity bytes directly from request
@@ -164,7 +178,10 @@ BiometricExtractionStage / FinalizationStage / UinGeneratorStage
           │
           │  uinDraftRepo.save(draft)
           │    ◄── IdRepoEntityInterceptor.onFlushDirty()
-          │        re-encrypt uinData + uin before DB flush
+          │        → POST ${mosip.kernel.keymanager.url}/v1/keymanager/encrypt (x2)
+          │          uinData: {appId, refId:uinDataRefId, data:b64(uinDataBytes)}
+          │          uin:     {appId, refId:uinRefId, data:b64(uin+salt)}
+          │          Resp:    {response:{data:"<AES-encrypted-b64>"}}
           │    → [uin_draft table — re-encrypted]
           │
           │  Response: IdResponseDTO
@@ -190,7 +207,11 @@ BiometricExtractionStage / FinalizationStage / UinGeneratorStage
           │  [IdRepoDraftServiceImpl.extractBiometrics()]
           │  @Transactional(NOT_SUPPORTED) — releases DB conn before S3 I/O
           │  uinDraftRepo.findByRegId(regId)
-          │    ◄── IdRepoEntityInterceptor.onLoad() — decrypt + hash-verify
+          │    ◄── IdRepoEntityInterceptor.onLoad()
+          │        → POST ${mosip.kernel.keymanager.url}/v1/keymanager/decrypt
+          │          Req : {appId, refId:uinDataRefId, data:"<AES-encrypted-b64>"}
+          │          Resp: {response:{data:"<decrypted-urlSafeBase64>"}}
+          │        hash-verify: HMACUtils2.digestAsPlainTextWithSalt() LOCAL
           │
           │  For each UinBiometricDraft entry (e.g. individualBiometrics):
           │    uinHash = draft.uinHash.split("_")[1]
@@ -204,10 +225,19 @@ BiometricExtractionStage / FinalizationStage / UinGeneratorStage
           │      bucket/{uinHash}/{bioFileId}   e.g. individualBiometrics.xml
           │      → returns raw CBEFF bytes
           │
-          │    BioSDK extraction:
-          │      POST ${mosip.mock.biosdk.url}/biosdk-service/{extractionFormat}/extracttemplates
-          │      → proxyService.getBiometricsForRequestedFormats(uinHash, bioFileId, formats, cbeff)
-          │      → returns extracted template bytes per modality
+          │    BioSDK extraction (via BIO_EXTRACTOR_SERVICE):
+          │      POST ${mosip.mock.biosdk.url}/biosdk-service/{extractionFormat}
+          │           /extracttemplates
+          │      ← RestServicesConstants.BIO_EXTRACTOR_SERVICE
+          │      Config: mosip.idrepo.bio-extractor-service.rest.uri
+          │      Req : { "cbeff": "<base64-CBEFF-XML>",
+          │              "modality": "finger|iris|face" }
+          │      Resp: { "templates": [{ "iso": "<base64-ISO-template>",
+          │                              "modality": "finger", ... }] }
+          │      → proxyService.getBiometricsForRequestedFormats(uinHash,
+          │            bioFileId, formats, cbeff)
+          │      (mosip.biosdk.default.service.url = same base URL,
+          │       used by Client_V_1_0 SDK library for modality matching)
           │
           │    S3 WRITE (new extracted files):
           │      bucket/{uinHash}/{bioFileId_noExt}.finger.ISO_19794_4_2011
@@ -227,12 +257,20 @@ BiometricExtractionStage / FinalizationStage / UinGeneratorStage
           │
           │  [IdRepoDraftServiceImpl.publishDraft()]
           │  uinDraftRepo.findByRegId(regId)
-          │    ◄── IdRepoEntityInterceptor.onLoad() — decrypt + hash-verify
+          │    ◄── IdRepoEntityInterceptor.onLoad()
+          │        → POST ${mosip.kernel.keymanager.url}/v1/keymanager/decrypt
+          │          Req : {appId, refId:uinDataRefId, data:"<AES-encrypted-b64>"}
+          │          Resp: {response:{data:"<decrypted-urlSafeBase64>"}}
+          │        hash-verify: HMACUtils2.digestAsPlainTextWithSalt() LOCAL
           │
           │  buildRequest(regId, draft) → IdRequestDTO (parses uinData JSON)
           │  validateRequest(request)
           │  uinEncryptSaltRepo.getOne(saltId) → salt
           │  securityManager.decryptWithSalt(encryptedUin, salt) → plain UIN
+          │    → POST ${mosip.kernel.keymanager.url}/v1/keymanager/decrypt
+          │      Req : {appId, refId:uinRefId, data:encryptedUin}
+          │      Resp: {response:{data:"<decrypted-urlSafeBase64>"}}
+          │      → Base64-decode → strip salt → plain UIN string
           │
           │  uinRepo.existsByUinHash(draft.uinHash) → true/false
           │
@@ -267,7 +305,11 @@ BiometricExtractionStage / FinalizationStage / UinGeneratorStage
           │   ② super.addIdentity(idRequest, uin)                          │
           │     → INSERT into uin table                                     │
           │     ◄── IdRepoEntityInterceptor.onSave()                        │
-          │         encrypt uinData (AES) + uin (AES+Salt) before INSERT    │
+          │         → POST ${mosip.kernel.keymanager.url}                  │
+          │              /v1/keymanager/encrypt  (x2: uinData + uin)       │
+          │           uinData:{appId,refId:uinDataRefId,data:b64(uinData)} │
+          │           uin:   {appId,refId:uinRefId,data:b64(uin+salt)}     │
+          │           Resp:  {response:{data:"<AES-encrypted-b64>"}}       │
           │     → S3: store identity documents + biometrics                 │
           │     → INSERT into uin_history                                   │
           │                                                                 │
@@ -299,7 +341,11 @@ BiometricExtractionStage / FinalizationStage / UinGeneratorStage
           │   super.updateIdentity(idRequest, uin)                        │
           │   → UPDATE uin table                                           │
           │   ◄── IdRepoEntityInterceptor.onFlushDirty()                  │
-          │       re-encrypt uinData + uin on UPDATE                      │
+          │       → POST ${mosip.kernel.keymanager.url}                   │
+          │            /v1/keymanager/encrypt  (x2: uinData + uin)        │
+          │         uinData:{appId,refId:uinDataRefId,data:b64(uinData)}  │
+          │         uin:   {appId,refId:uinRefId,data:b64(uin+salt)}      │
+          │         Resp:  {response:{data:"<AES-encrypted-b64>"}}        │
           │   → INSERT uin_history row                                     │
           │   → S3: update changed documents / biometrics                 │
           └────────────────────────────────────────────────────────────────┘
@@ -517,6 +563,63 @@ BiometricExtractionStage / FinalizationStage / UinGeneratorStage
   Partner receives:
     Body   : { "id": "...", "response": { "authStatus": true }, "errors": [] }
     Header : response-signature: <JWS>
+
+══════════════════════════════════════════════════════════════════════════════
+  ALL EXTERNAL REST SERVICE CALLS — from id-repository-default.properties
+══════════════════════════════════════════════════════════════════════════════
+
+  SERVICE CONSTANT                  METHOD  URI
+  ──────────────────────────────────────────────────────────────────────────
+  CRYPTO_MANAGER_ENCRYPT            POST    ${mosip.kernel.keymanager.url}
+  (mosip.idrepo.encryptor)                  /v1/keymanager/encrypt
+  CRYPTO_MANAGER_DECRYPT            POST    ${mosip.kernel.keymanager.url}
+  (mosip.idrepo.decryptor)                  /v1/keymanager/decrypt
+  ──────────────────────────────────────────────────────────────────────────
+  UIN_GENERATOR_SERVICE             GET     ${mosip.kernel.idgenerator.url}
+  (mosip.idrepo.uin-generator)              /v1/idgenerator/uin
+  VID_GENERATOR_SERVICE             GET     ${mosip.kernel.idgenerator.url}
+  (mosip.idrepo.vid-generator)              /v1/idgenerator/vid
+  ──────────────────────────────────────────────────────────────────────────
+  VID_DRAFT_GENERATOR_SERVICE       POST    ${mosip.idrepo.vid.url}
+  (mosip.idrepo.draft-vid)                  /idrepository/v1/draft/vid
+  VID_UPDATE_SERVICE                PATCH   ${mosip.idrepo.vid.url}
+  (mosip.idrepo.update-vid)                 /idrepository/v1/vid/{vid}
+  ──────────────────────────────────────────────────────────────────────────
+  BIO_EXTRACTOR_SERVICE             POST    ${mosip.mock.biosdk.url}
+  (mosip.idrepo.bio-extractor-svc)          /biosdk-service/{extractionFormat}
+                                            /extracttemplates
+  (SDK client lib base URL:                 ${mosip.mock.biosdk.url}/biosdk-service
+   mosip.biosdk.default.service.url         used by Client_V_1_0 for
+   = mosip.mock.biosdk.url/biosdk-service)  finger/iris/face providers)
+  ──────────────────────────────────────────────────────────────────────────
+  PARTNER_SERVICE                   GET     ${mosip.pms.partnermanager.url}
+  (mosip.idrepo.pmp.partner)                /v1/partnermanager/partners
+                                            ?partnerType=Online_Verification_Partner
+  PARTNER_EXTRACTION_POLICY         GET     ${mosip.pms.partnermanager.url}
+                                            /v1/partnermanager/partners/{partnerId}
+                                            /bioextractors/{policyId}
+  ──────────────────────────────────────────────────────────────────────────
+  CREDENTIAL_REQUEST_SERVICE        POST    ${mosip.idrepo.credrequest.url}
+  (mosip.idrepo.credential.request)         /v1/credentialrequest/requestgenerator
+  CREDENTIAL_REQUEST_SERVICE_V2     POST    ${mosip.idrepo.credrequest.url}
+  (mosip.idrepo.credential-req-v2)          /v1/credentialrequest/v2/requestgenerator/{rid}
+  CREDENTIAL_CANCEL_SERVICE         DELETE  ${mosip.idrepo.credrequest.url}
+  (mosip.idrepo.credential.cancel)          /v1/credentialrequest/cancel/{requestId}
+  ──────────────────────────────────────────────────────────────────────────
+  AUDIT_MANAGER_SERVICE             POST    ${mosip.kernel.auditmanager.url}
+  (mosip.idrepo.audit)                      /v1/auditmanager/audits
+  ──────────────────────────────────────────────────────────────────────────
+  (id-repo identity lookup)         GET     ${mosip.idrepo.identity.url}
+  (mosip.idrepo.retrieve-by-uin)            /idrepository/v1/identity/idvid/{uin}
+  (mosip.idrepo.vid-service)        GET     ${mosip.idrepo.vid.url}
+                                            /idrepository/v1/vid/uin/{uin}
+  (mosip.idrepo.retrieve-uin-by-vid)GET     ${mosip.idrepo.vid.url}
+                                            /idrepository/v1/vid/{vid}
+  (mosip.idrepo.syncdata-service)   GET     ${mosip.kernel.masterdata.url}
+                                            /v1/masterdata/idschema/latest
+  ──────────────────────────────────────────────────────────────────────────
+  NOTE: HMAC-SHA256 hash verification (in onLoad) is LOCAL — no REST call.
+        Uses HMACUtils2.digestAsPlainTextWithSalt() in-process.
 ```
 
 ---
