@@ -1,0 +1,315 @@
+sequenceDiagram
+    autonumber
+
+    %% ─────────────────────────────────────────────────────────────────
+    %% Participants
+    %% ─────────────────────────────────────────────────────────────────
+    participant UIN as UinGeneratorStage<br/>(reg-processor)
+    participant BIO as BiometricExtractionStage<br/>(reg-processor)
+    participant FIN as FinalizationStage<br/>(reg-processor)
+    participant DraftSvc as IdrepoDraftService<br/>(packet-manager)
+    participant REST as RegistrationProcessorRestClient
+    participant FILT as IdRepoFilter<br/>(HTTP — log/timing only)
+    participant CTRL as IdRepoDraftController<br/>(id-repository)
+    participant SvcImpl as IdRepoDraftServiceImpl<br/>(id-repository)
+    participant INTC as IdRepoEntityInterceptor<br/>(Hibernate — encrypt/decrypt)
+    participant DB as UinDraftRepo<br/>(Database — encrypted at rest)
+    participant UinDB as UinRepo / UinHistoryRepo<br/>(Database — encrypted at rest)
+    participant S3 as ObjectStoreHelper<br/>(S3 / MinIO)
+    participant Proxy as IdRepoProxyServiceImpl<br/>(id-repository)
+    participant UINGen as Kernel UIN Generator<br/>(external service)
+    participant VID as VID Service<br/>(external service)
+
+    %% =================================================================
+    %% PHASE 1: UIN Generator Stage — idrepoUpdateDraft
+    %% =================================================================
+    rect rgb(230, 245, 255)
+        Note over UIN,VID: ① UIN GENERATOR STAGE — idrepoUpdateDraft flow
+
+        UIN->>DraftSvc: idrepoUpdateDraft(regId, uin, idRequestDTO)
+
+        %% Step 1: hasDraft check
+        DraftSvc->>REST: headApi(IDREPOHASDRAFT, [regId])
+        REST->>FILT: HTTP HEAD /idrepository/v1/identity/draft/{regId}<br/>[IdRepoFilter — logs timing, passes through]
+        FILT->>CTRL: HEAD /idrepository/v1/identity/draft/{regId}
+        CTRL->>SvcImpl: hasDraft(regId)
+        SvcImpl->>DB: uinDraftRepo.existsByRegId(regId)
+        DB-->>SvcImpl: true / false
+        SvcImpl-->>CTRL: true / false
+        CTRL-->>REST: HTTP 200 (exists) or 204 (not found)
+        REST-->>DraftSvc: Integer 200 or 204
+
+        alt Draft does NOT exist (204)
+            %% Step 2a: Create draft
+            Note over DraftSvc,VID: No draft found — create one first
+            DraftSvc->>REST: postApi(IDREPOCREATEDRAFT, [regId], "UIN", uin)
+            REST->>CTRL: POST /draft/create/{regId}?UIN={uin}
+            CTRL->>SvcImpl: createDraft(regId, uin)
+
+            alt UIN provided (update/correction flow)
+                SvcImpl->>UinDB: uinRepo.findByUinHash(uinHash)
+                UinDB-->>SvcImpl: existing Uin entity
+                SvcImpl->>SvcImpl: mapper.convertValue(uin → UinDraft)
+                SvcImpl->>SvcImpl: updateBiometricAndDocumentDrafts()<br/>[O(N) merge — no entity mutation]
+            else No UIN (new registration)
+                SvcImpl->>UINGen: idRepoServiceHelper.generateUin()<br/>[Propagation.NOT_SUPPORTED — releases DB conn]
+                UINGen-->>SvcImpl: new UIN string
+                SvcImpl->>SvcImpl: generateIdentityObject(uin)<br/>→ {"identity":{"UIN":"..."}}
+            end
+
+            SvcImpl->>INTC: onSave(UinDraft entity)<br/>encrypt uinData (AES, uinDataRefId)<br/>encrypt uin (AES+Salt)
+            INTC->>DB: uinDraftRepo.save(newDraft) [encrypted bytes]
+            DB-->>INTC: saved
+            INTC-->>SvcImpl: (transparent)
+            SvcImpl-->>CTRL: IdResponseDTO (status=DRAFTED)
+            CTRL-->>REST: HTTP 200
+            REST-->>DraftSvc: ResponseWrapper
+
+        else Draft EXISTS (200)
+            %% Step 2b: Get existing draft to preserve UIN
+            Note over DraftSvc,S3: Draft found — fetch to preserve UIN before update
+            DraftSvc->>REST: getApi(IDREPOGETDRAFT, [regId])
+            REST->>CTRL: GET /draft/{regId}
+            CTRL->>SvcImpl: getDraft(regId, extractionFormats)
+            SvcImpl->>DB: uinDraftRepo.findByRegId(regId)
+            DB-->>INTC: encrypted UinDraft row
+            INTC->>INTC: onLoad() — decrypt uinData (AES)<br/>verify SHA-256 hash == uinDataHash
+            INTC-->>SvcImpl: UinDraft entity (plain text)
+
+            loop For each UinBiometricDraft
+                SvcImpl->>S3: objectStoreHelper.getBiometricObject(uinHash, bioFileId)
+                S3-->>SvcImpl: raw CBEFF bytes
+            end
+            loop For each UinDocumentDraft
+                SvcImpl->>S3: objectStoreHelper.getDemographicObject(uinHash, docId)
+                S3-->>SvcImpl: document bytes
+            end
+
+            SvcImpl-->>CTRL: IdResponseDTO (identity + docs + biometrics)
+            CTRL-->>REST: HTTP 200
+            REST-->>DraftSvc: ResponseDTO (with existing UIN)
+            DraftSvc->>DraftSvc: Merge: inject existingIdentity.UIN<br/>into new idRequestDto payload
+        end
+
+        %% Step 3: Update draft (always)
+        DraftSvc->>REST: patchApi(IDREPOUPDATEDRAFT, [regId], idRequestDto)
+        REST->>CTRL: PATCH /draft/update/{regId}
+        CTRL->>SvcImpl: updateDraft(regId, request)
+        SvcImpl->>DB: uinDraftRepo.findByRegId(regId)
+        DB-->>SvcImpl: UinDraft
+
+        alt First update (uinData is null)
+            SvcImpl->>SvcImpl: convert identity → bytes, hash
+            SvcImpl->>S3: super.updateDocuments() → upload new doc files
+            S3-->>SvcImpl: stored
+        else Subsequent update (uinData exists)
+            SvcImpl->>SvcImpl: updateDemographicData()<br/>JsonPath parse → JSONCompare diff → merge
+            SvcImpl->>S3: super.updateDocuments() → upload changed docs
+            S3-->>SvcImpl: stored
+            SvcImpl->>SvcImpl: updateBiometricAndDocumentDrafts()<br/>[O(N) sync, no entity mutation]
+        end
+
+        SvcImpl->>INTC: onFlushDirty(UinDraft)<br/>re-encrypt uinData + uin before flush
+        INTC->>DB: uinDraftRepo.save(draftToUpdate) [re-encrypted]
+        DB-->>SvcImpl: saved
+        SvcImpl-->>CTRL: IdResponseDTO (status=DRAFTED)
+        CTRL-->>REST: HTTP 200
+        REST-->>DraftSvc: IdResponseDTO
+
+        alt Update returned errors (e.g. key manager error)
+            DraftSvc->>REST: deleteApi(IDREPODISCARDDRAFT, [regId])
+            REST->>CTRL: DELETE /draft/discard/{regId}
+            CTRL->>SvcImpl: discardDraft(regId)
+            SvcImpl->>DB: uinDraftRepo.deleteByRegId(regId)
+            DB-->>SvcImpl: deleted
+            SvcImpl-->>CTRL: "DISCARDED"
+            CTRL-->>REST: HTTP 200
+            REST-->>DraftSvc: ok
+            DraftSvc-->>UIN: throw IdrepoDraftException /<br/>IdrepoDraftReprocessableException
+        else Update success
+            DraftSvc-->>UIN: IdResponseDTO
+        end
+    end
+
+    %% =================================================================
+    %% PHASE 2: Biometric Extraction Stage
+    %% =================================================================
+    rect rgb(255, 245, 225)
+        Note over BIO,S3: ② BIOMETRIC EXTRACTION STAGE
+
+        BIO->>DraftSvc: idrepoHasDraft(regId)
+        DraftSvc->>REST: headApi(IDREPOHASDRAFT, [regId])
+        REST->>CTRL: HEAD /draft/{regId}
+        CTRL->>SvcImpl: hasDraft(regId)
+        SvcImpl->>DB: uinDraftRepo.existsByRegId(regId)
+        DB-->>SvcImpl: true/false
+        SvcImpl-->>CTRL: true/false
+        CTRL-->>REST: 200 / 204
+        REST-->>DraftSvc: 200 / 204
+        DraftSvc-->>BIO: true / false
+
+        alt Draft NOT found (false)
+            BIO->>BIO: Set status = FAILED<br/>StatusUtil.BIOMETRIC_EXTRACTION_DRAFT_REQUEST_UNAVAILABLE
+        else Draft found (true)
+            BIO->>BIO: getExtractors(regId) → PMS API call<br/>fetch extractor list
+            loop For each extractor
+                BIO->>REST: putApi(EXTRACTBIOMETRICS, [regId], extractionFormats)
+                REST->>CTRL: PUT /draft/extractbiometrics/{regId}?finger=..&iris=..&face=..
+                CTRL->>SvcImpl: extractBiometrics(regId, extractionFormats)
+                Note over SvcImpl: @Transactional(NOT_SUPPORTED)<br/>DB conn released before S3 I/O
+
+                SvcImpl->>DB: uinDraftRepo.findByRegId(regId)
+                DB-->>SvcImpl: UinDraft
+
+                loop For each UinBiometricDraft
+                    SvcImpl->>S3: deleteBiometricObject(uinHash, extractedFileName)<br/>[non-fatal, logs on failure]
+                    S3-->>SvcImpl: deleted (or warned)
+                    SvcImpl->>S3: getBiometricObject(uinHash, bioFileId)
+                    S3-->>SvcImpl: raw CBEFF bytes
+                    SvcImpl->>Proxy: getBiometricsForRequestedFormats(uinHash, bioFileId, formats, cbeff)
+                    Proxy-->>SvcImpl: extracted biometric bytes
+                    SvcImpl->>S3: store extracted result
+                    S3-->>SvcImpl: stored
+                end
+
+                SvcImpl-->>CTRL: IdResponseDTO (status=DRAFTED)
+                CTRL-->>REST: HTTP 200
+                REST-->>BIO: success
+            end
+
+            BIO->>BIO: Set status = PROCESSING (success)
+
+            alt Error during extraction
+                BIO->>DraftSvc: idrepoDiscardDraft(regId)
+                DraftSvc->>REST: deleteApi(IDREPODISCARDDRAFT, [regId])
+                REST->>CTRL: DELETE /draft/discard/{regId}
+                CTRL->>SvcImpl: discardDraft(regId)
+                SvcImpl->>DB: uinDraftRepo.deleteByRegId(regId)
+                DB-->>SvcImpl: deleted
+                CTRL-->>REST: HTTP 200
+                REST-->>BIO: ok
+                BIO->>BIO: Set status = FAILED
+            end
+        end
+    end
+
+    %% =================================================================
+    %% PHASE 3: Finalization Stage — publishDraft
+    %% =================================================================
+    rect rgb(230, 255, 235)
+        Note over FIN,VID: ③ FINALIZATION STAGE — publishDraft flow
+
+        FIN->>DraftSvc: idrepoHasDraft(regId)
+        DraftSvc->>REST: headApi(IDREPOHASDRAFT, [regId])
+        REST->>CTRL: HEAD /draft/{regId}
+        CTRL->>SvcImpl: hasDraft(regId)
+        SvcImpl->>DB: uinDraftRepo.existsByRegId(regId)
+        DB-->>SvcImpl: true/false
+        CTRL-->>REST: 200 / 204
+        REST-->>DraftSvc: 200 / 204
+        DraftSvc-->>FIN: true / false
+
+        alt Draft NOT found (false)
+            FIN->>FIN: Set status = FAILED<br/>StatusUtil.FINALIZATION_DRAFT_REQUEST_UNAVAILABLE
+        else Draft found (true)
+            FIN->>DraftSvc: idrepoPublishDraft(regId)
+            DraftSvc->>REST: getApi(IDREPOPUBLISHDRAFT, [regId])
+            REST->>CTRL: GET /draft/publish/{regId}
+            CTRL->>SvcImpl: publishDraft(regId)
+
+            SvcImpl->>DB: uinDraftRepo.findByRegId(regId)
+            DB-->>SvcImpl: UinDraft entity
+
+            SvcImpl->>SvcImpl: anonymousProfileHelper.setNewCbeff()
+            SvcImpl->>SvcImpl: buildRequest(regId, draft)<br/>parse uinData → IdRequestDTO<br/>remove verifiedAttributes from identity map
+            SvcImpl->>SvcImpl: validateRequest(request)
+
+            SvcImpl->>DB: uinEncryptSaltRepo.getOne(saltId)
+            DB-->>SvcImpl: salt
+            SvcImpl->>SvcImpl: securityManager.decryptWithSalt(encryptedUin, salt)<br/>→ plain UIN string
+
+            SvcImpl->>UinDB: uinRepo.existsByUinHash(draft.uinHash)
+            UinDB-->>SvcImpl: true (update) / false (new)
+
+            alt New Identity (UIN not yet in live table)
+                SvcImpl->>VID: vidDraftHelper.generateDraftVid(uin)
+                VID-->>SvcImpl: draftVid
+                SvcImpl->>SvcImpl: super.addIdentity(idRequest, uin)
+                Note over SvcImpl,INTC: IdRepoEntityInterceptor.onSave()<br/>encrypts uinData (AES) + uin (AES+Salt)<br/>before INSERT
+                SvcImpl->>UinDB: INSERT uin, uin_history [encrypted]
+                SvcImpl->>S3: store identity documents / biometrics
+                SvcImpl->>VID: vidDraftHelper.activateDraftVid(draftVid)
+                VID-->>SvcImpl: activated
+            else Existing Identity (update/correction)
+                SvcImpl->>SvcImpl: super.updateIdentity(idRequest, uin)
+                Note over SvcImpl,INTC: IdRepoEntityInterceptor.onFlushDirty()<br/>re-encrypts uinData + uin before UPDATE
+                SvcImpl->>UinDB: UPDATE uin, INSERT uin_history [encrypted]
+                SvcImpl->>S3: update changed documents / biometrics
+            end
+
+            SvcImpl->>SvcImpl: anonymousProfileHelper.buildAndsaveProfile(true)
+
+            SvcImpl->>SvcImpl: publishDocuments(draft, uinObject)
+            SvcImpl->>DB: uinBiometricRepo.saveAll(biometrics from draft)
+            DB-->>SvcImpl: saved
+            SvcImpl->>DB: uinDocumentRepo.saveAll(documents from draft)
+            DB-->>SvcImpl: saved
+
+            SvcImpl->>DB: uinDraftRepo.deleteByRegId(regId)
+            DB-->>SvcImpl: draft deleted
+
+            SvcImpl-->>CTRL: IdResponseDTO (status = ACTIVATED / DEACTIVATED)
+            CTRL-->>REST: HTTP 200
+            REST-->>DraftSvc: IdResponseDTO
+
+            alt publishDraft returned errors
+                alt Error code = IDR-IDS-003 (key manager error)
+                    DraftSvc-->>FIN: throw IdrepoDraftReprocessableException<br/>[packet retried — status = PROCESSING]
+                else Other error
+                    DraftSvc->>REST: deleteApi(IDREPODISCARDDRAFT, [regId])
+                    REST->>CTRL: DELETE /draft/discard/{regId}
+                    CTRL->>SvcImpl: discardDraft(regId)
+                    SvcImpl->>DB: uinDraftRepo.deleteByRegId(regId)
+                    DB-->>SvcImpl: deleted
+                    CTRL-->>REST: HTTP 200
+                    DraftSvc-->>FIN: throw IdrepoDraftException<br/>[packet FAILED]
+                end
+            else Publish success
+                DraftSvc-->>FIN: IdResponseDTO
+                FIN->>FIN: Set status = PROCESSING<br/>(pass to next stage)
+            end
+        end
+    end
+
+    %% =================================================================
+    %% PHASE 4: IDA Authentication Filter Chain (encrypt/decrypt layer)
+    %% =================================================================
+    rect rgb(245, 230, 255)
+        Note over UIN,VID: ④ IDA AUTH FILTER CHAIN — how auth requests are decrypted before reaching controller
+
+        participant AUTHCLIENT as Auth Partner / Client
+        participant IDAFILT as BaseIDAFilter→BaseAuthFilter<br/>→IdAuthFilter (IDA)
+        participant IDACTRL as AuthController<br/>(IDA)
+        participant IDACACHE as IdentityCache<br/>(IDA DB)
+
+        AUTHCLIENT->>IDAFILT: POST /auth/{mispLK}/{partnerId}/{apiKey}<br/>Headers: signature (JWS)<br/>Body: {id, version, request(encrypted+base64), requestSessionKey(RSA-encrypted), requestHMAC, thumbprint}
+
+        Note over IDAFILT: Step 1 — BaseIDAFilter<br/>Validate `id` field matches config<br/>Validate `version` format (regex)
+
+        Note over IDAFILT: Step 2 — BaseAuthFilter.authenticateRequest()<br/>keyManager.verifySignature(signature header)<br/>Validates RSA cert trust chain
+
+        Note over IDAFILT: Step 3 — IdAuthFilter.decipherRequest()<br/>decode(requestSessionKey) → encryptedSessionKey bytes<br/>keyManager.kernelDecryptAndDecode(thumbprint, encryptedSessionKey, encryptedHMAC, IDA_refId)<br/>→ RSA-decrypts session key with IDA private key<br/>→ AES-decrypts HMAC → validates integrity<br/>keyManager.requestData() → AES-decrypts `request` field<br/>→ replaces encrypted request with plain Map
+
+        Note over IDAFILT: Step 4 — decipherBioData() (if biometrics present)<br/>per segment: decode JWS payload → verify digitalId signature<br/>compute salt = Base64(XOR(timestamp,txnId)[-2:bytes])<br/>compute aad  = Base64(XOR(timestamp,txnId)[-3:bytes])<br/>keyManager.kernelDecrypt(thumbprint, encBioSessionKey, encBioValue, BIO_refId, aad, salt)<br/>→ AES-GCM decrypts each Biometric Data Block (BDB)
+
+        Note over IDAFILT: Step 5 — IdAuthFilter.validateDecipheredRequest()<br/>partnerService.validateAndGetPolicy(partnerId)<br/>checkMispPolicyAllowed(), checkAllowedAuthTypeBasedOnPolicy()<br/>addMetadata(partnerId, partnerPolicy) to request map
+
+        IDAFILT->>IDACTRL: decrypted plain-text request Map
+        IDACTRL->>IDACACHE: fetch identity by idHash
+        IDACACHE-->>IDACTRL: demographicData + biometricData (plain)
+        IDACTRL-->>IDAFILT: authentication result (JSON)
+
+        Note over IDAFILT: consumeResponse()<br/>keyManager.signResponse(responseAsString)<br/>→ signs with IDA private key (JWS)<br/>→ sets `response-signature` HTTP header
+
+        IDAFILT-->>AUTHCLIENT: HTTP 200 JSON + response-signature header
+    end
