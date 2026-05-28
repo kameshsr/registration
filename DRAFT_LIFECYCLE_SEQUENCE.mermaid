@@ -1,315 +1,152 @@
+%%{init: {'themeVariables': { 'activationBkgColor': '#80ffd5', 'activationBorderColor': '#009977' }}}%%
 sequenceDiagram
-    autonumber
+    participant reg_processor as Registration Processor
+    participant identity_service as Identity Service (IDRepo)
+    participant vid_service as VID Service
+    participant object_store as Object Store (S3/MinIO)
+    participant credential_request_generator as Credential Request Generator
+    participant credential_service as Credential Service
+    participant data_share as Data Share
+    participant websub as WebSub
+    participant ida as ID Authentication
 
     %% ─────────────────────────────────────────────────────────────────
-    %% Participants
+    Note over reg_processor,identity_service: STEP 1: UIN Generator Stage
     %% ─────────────────────────────────────────────────────────────────
-    participant UIN as UinGeneratorStage<br/>(reg-processor)
-    participant BIO as BiometricExtractionStage<br/>(reg-processor)
-    participant FIN as FinalizationStage<br/>(reg-processor)
-    participant DraftSvc as IdrepoDraftService<br/>(packet-manager)
-    participant REST as RegistrationProcessorRestClient
-    participant FILT as IdRepoFilter<br/>(HTTP — log/timing only)
-    participant CTRL as IdRepoDraftController<br/>(id-repository)
-    participant SvcImpl as IdRepoDraftServiceImpl<br/>(id-repository)
-    participant INTC as IdRepoEntityInterceptor<br/>(Hibernate — encrypt/decrypt)
-    participant DB as UinDraftRepo<br/>(Database — encrypted at rest)
-    participant UinDB as UinRepo / UinHistoryRepo<br/>(Database — encrypted at rest)
-    participant S3 as ObjectStoreHelper<br/>(S3 / MinIO)
-    participant Proxy as IdRepoProxyServiceImpl<br/>(id-repository)
-    participant UINGen as Kernel UIN Generator<br/>(external service)
-    participant VID as VID Service<br/>(external service)
 
-    %% =================================================================
-    %% PHASE 1: UIN Generator Stage — idrepoUpdateDraft
-    %% =================================================================
-    rect rgb(230, 245, 255)
-        Note over UIN,VID: ① UIN GENERATOR STAGE — idrepoUpdateDraft flow
+    reg_processor->>identity_service: HEAD /identity/draft/{regId} (hasDraft check)
+    activate identity_service
+    identity_service-->>reg_processor: 204 No Content (draft not found)
+    deactivate identity_service
 
-        UIN->>DraftSvc: idrepoUpdateDraft(regId, uin, idRequestDTO)
+    reg_processor->>identity_service: POST /identity/draft/create/{regId}?UIN={uin}
+    activate identity_service
+    identity_service->>identity_service: Generate new UIN (if new registration)<br/>or clone existing identity (if correction/update)
+    identity_service->>object_store: Store identity documents
+    identity_service-->>reg_processor: Draft created (status=DRAFTED)
+    deactivate identity_service
 
-        %% Step 1: hasDraft check
-        DraftSvc->>REST: headApi(IDREPOHASDRAFT, [regId])
-        REST->>FILT: HTTP HEAD /idrepository/v1/identity/draft/{regId}<br/>[IdRepoFilter — logs timing, passes through]
-        FILT->>CTRL: HEAD /idrepository/v1/identity/draft/{regId}
-        CTRL->>SvcImpl: hasDraft(regId)
-        SvcImpl->>DB: uinDraftRepo.existsByRegId(regId)
-        DB-->>SvcImpl: true / false
-        SvcImpl-->>CTRL: true / false
-        CTRL-->>REST: HTTP 200 (exists) or 204 (not found)
-        REST-->>DraftSvc: Integer 200 or 204
+    reg_processor->>identity_service: PATCH /identity/draft/update/{regId}
+    activate identity_service
+    identity_service->>identity_service: Merge demographic data + biometrics<br/>into draft (JSONCompare diff)
+    identity_service->>object_store: Upload changed documents / biometrics
+    identity_service-->>reg_processor: Draft updated (status=DRAFTED)
+    deactivate identity_service
 
-        alt Draft does NOT exist (204)
-            %% Step 2a: Create draft
-            Note over DraftSvc,VID: No draft found — create one first
-            DraftSvc->>REST: postApi(IDREPOCREATEDRAFT, [regId], "UIN", uin)
-            REST->>CTRL: POST /draft/create/{regId}?UIN={uin}
-            CTRL->>SvcImpl: createDraft(regId, uin)
+    %% ─────────────────────────────────────────────────────────────────
+    Note over reg_processor,object_store: STEP 2: Biometric Extraction Stage
+    %% ─────────────────────────────────────────────────────────────────
 
-            alt UIN provided (update/correction flow)
-                SvcImpl->>UinDB: uinRepo.findByUinHash(uinHash)
-                UinDB-->>SvcImpl: existing Uin entity
-                SvcImpl->>SvcImpl: mapper.convertValue(uin → UinDraft)
-                SvcImpl->>SvcImpl: updateBiometricAndDocumentDrafts()<br/>[O(N) merge — no entity mutation]
-            else No UIN (new registration)
-                SvcImpl->>UINGen: idRepoServiceHelper.generateUin()<br/>[Propagation.NOT_SUPPORTED — releases DB conn]
-                UINGen-->>SvcImpl: new UIN string
-                SvcImpl->>SvcImpl: generateIdentityObject(uin)<br/>→ {"identity":{"UIN":"..."}}
-            end
+    reg_processor->>identity_service: HEAD /identity/draft/{regId} (hasDraft check)
+    activate identity_service
+    identity_service-->>reg_processor: 200 OK (draft exists)
+    deactivate identity_service
 
-            SvcImpl->>INTC: onSave(UinDraft entity)<br/>encrypt uinData (AES, uinDataRefId)<br/>encrypt uin (AES+Salt)
-            INTC->>DB: uinDraftRepo.save(newDraft) [encrypted bytes]
-            DB-->>INTC: saved
-            INTC-->>SvcImpl: (transparent)
-            SvcImpl-->>CTRL: IdResponseDTO (status=DRAFTED)
-            CTRL-->>REST: HTTP 200
-            REST-->>DraftSvc: ResponseWrapper
+    reg_processor->>identity_service: PUT /identity/draft/extractbiometrics/{regId}?finger=..&iris=..&face=..
+    activate identity_service
+    identity_service->>object_store: Read raw CBEFF biometric file
+    object_store-->>identity_service: CBEFF bytes
+    identity_service->>identity_service: Call BioSDK service to extract templates<br/>POST /biosdk-service/{format}/extracttemplates
+    identity_service->>object_store: Write extracted template files<br/>(e.g. individualBiometrics.finger.ISO_19794_4_2011)
+    identity_service-->>reg_processor: Biometrics extracted (status=DRAFTED)
+    deactivate identity_service
 
-        else Draft EXISTS (200)
-            %% Step 2b: Get existing draft to preserve UIN
-            Note over DraftSvc,S3: Draft found — fetch to preserve UIN before update
-            DraftSvc->>REST: getApi(IDREPOGETDRAFT, [regId])
-            REST->>CTRL: GET /draft/{regId}
-            CTRL->>SvcImpl: getDraft(regId, extractionFormats)
-            SvcImpl->>DB: uinDraftRepo.findByRegId(regId)
-            DB-->>INTC: encrypted UinDraft row
-            INTC->>INTC: onLoad() — decrypt uinData (AES)<br/>verify SHA-256 hash == uinDataHash
-            INTC-->>SvcImpl: UinDraft entity (plain text)
+    %% ─────────────────────────────────────────────────────────────────
+    Note over reg_processor,vid_service: STEP 3: Finalization Stage — publishDraft
+    %% ─────────────────────────────────────────────────────────────────
 
-            loop For each UinBiometricDraft
-                SvcImpl->>S3: objectStoreHelper.getBiometricObject(uinHash, bioFileId)
-                S3-->>SvcImpl: raw CBEFF bytes
-            end
-            loop For each UinDocumentDraft
-                SvcImpl->>S3: objectStoreHelper.getDemographicObject(uinHash, docId)
-                S3-->>SvcImpl: document bytes
-            end
+    reg_processor->>identity_service: HEAD /identity/draft/{regId} (hasDraft check)
+    activate identity_service
+    identity_service-->>reg_processor: 200 OK (draft exists)
+    deactivate identity_service
 
-            SvcImpl-->>CTRL: IdResponseDTO (identity + docs + biometrics)
-            CTRL-->>REST: HTTP 200
-            REST-->>DraftSvc: ResponseDTO (with existing UIN)
-            DraftSvc->>DraftSvc: Merge: inject existingIdentity.UIN<br/>into new idRequestDto payload
-        end
+    reg_processor->>identity_service: GET /identity/draft/publish/{regId}
+    activate identity_service
 
-        %% Step 3: Update draft (always)
-        DraftSvc->>REST: patchApi(IDREPOUPDATEDRAFT, [regId], idRequestDto)
-        REST->>CTRL: PATCH /draft/update/{regId}
-        CTRL->>SvcImpl: updateDraft(regId, request)
-        SvcImpl->>DB: uinDraftRepo.findByRegId(regId)
-        DB-->>SvcImpl: UinDraft
+    identity_service->>vid_service: POST /idrepository/v1/draft/vid<br/>{ uin, vidType: PERPETUAL } — create DRAFT VID
+    activate vid_service
+    vid_service-->>identity_service: { VID: "123..." } (status=DRAFT)
+    deactivate vid_service
 
-        alt First update (uinData is null)
-            SvcImpl->>SvcImpl: convert identity → bytes, hash
-            SvcImpl->>S3: super.updateDocuments() → upload new doc files
-            S3-->>SvcImpl: stored
-        else Subsequent update (uinData exists)
-            SvcImpl->>SvcImpl: updateDemographicData()<br/>JsonPath parse → JSONCompare diff → merge
-            SvcImpl->>S3: super.updateDocuments() → upload changed docs
-            S3-->>SvcImpl: stored
-            SvcImpl->>SvcImpl: updateBiometricAndDocumentDrafts()<br/>[O(N) sync, no entity mutation]
-        end
+    identity_service->>identity_service: INSERT identity into uin table (new)<br/>or UPDATE uin table (correction)
+    identity_service->>object_store: Store final identity documents + biometrics
+    identity_service->>identity_service: INSERT into uin_history
 
-        SvcImpl->>INTC: onFlushDirty(UinDraft)<br/>re-encrypt uinData + uin before flush
-        INTC->>DB: uinDraftRepo.save(draftToUpdate) [re-encrypted]
-        DB-->>SvcImpl: saved
-        SvcImpl-->>CTRL: IdResponseDTO (status=DRAFTED)
-        CTRL-->>REST: HTTP 200
-        REST-->>DraftSvc: IdResponseDTO
+    identity_service->>vid_service: PATCH /idrepository/v1/vid/{vid}<br/>{ vidStatus: ACTIVE } — activate VID
+    activate vid_service
+    vid_service-->>identity_service: VID activated
+    deactivate vid_service
 
-        alt Update returned errors (e.g. key manager error)
-            DraftSvc->>REST: deleteApi(IDREPODISCARDDRAFT, [regId])
-            REST->>CTRL: DELETE /draft/discard/{regId}
-            CTRL->>SvcImpl: discardDraft(regId)
-            SvcImpl->>DB: uinDraftRepo.deleteByRegId(regId)
-            DB-->>SvcImpl: deleted
-            SvcImpl-->>CTRL: "DISCARDED"
-            CTRL-->>REST: HTTP 200
-            REST-->>DraftSvc: ok
-            DraftSvc-->>UIN: throw IdrepoDraftException /<br/>IdrepoDraftReprocessableException
-        else Update success
-            DraftSvc-->>UIN: IdResponseDTO
-        end
-    end
+    identity_service->>identity_service: Delete draft row from uin_draft table
+    identity_service-->>reg_processor: Identity published (status=ACTIVATED)
+    deactivate identity_service
 
-    %% =================================================================
-    %% PHASE 2: Biometric Extraction Stage
-    %% =================================================================
-    rect rgb(255, 245, 225)
-        Note over BIO,S3: ② BIOMETRIC EXTRACTION STAGE
+    %% ─────────────────────────────────────────────────────────────────
+    Note over identity_service,credential_request_generator: STEP 4: Credential Generation
+    %% ─────────────────────────────────────────────────────────────────
 
-        BIO->>DraftSvc: idrepoHasDraft(regId)
-        DraftSvc->>REST: headApi(IDREPOHASDRAFT, [regId])
-        REST->>CTRL: HEAD /draft/{regId}
-        CTRL->>SvcImpl: hasDraft(regId)
-        SvcImpl->>DB: uinDraftRepo.existsByRegId(regId)
-        DB-->>SvcImpl: true/false
-        SvcImpl-->>CTRL: true/false
-        CTRL-->>REST: 200 / 204
-        REST-->>DraftSvc: 200 / 204
-        DraftSvc-->>BIO: true / false
+    identity_service->>identity_service: Creates entry with status NEW<br/>into credential_request_status table
 
-        alt Draft NOT found (false)
-            BIO->>BIO: Set status = FAILED<br/>StatusUtil.BIOMETRIC_EXTRACTION_DRAFT_REQUEST_UNAVAILABLE
-        else Draft found (true)
-            BIO->>BIO: getExtractors(regId) → PMS API call<br/>fetch extractor list
-            loop For each extractor
-                BIO->>REST: putApi(EXTRACTBIOMETRICS, [regId], extractionFormats)
-                REST->>CTRL: PUT /draft/extractbiometrics/{regId}?finger=..&iris=..&face=..
-                CTRL->>SvcImpl: extractBiometrics(regId, extractionFormats)
-                Note over SvcImpl: @Transactional(NOT_SUPPORTED)<br/>DB conn released before S3 I/O
+    identity_service->>identity_service: CredentialStatusHandler job runs
 
-                SvcImpl->>DB: uinDraftRepo.findByRegId(regId)
-                DB-->>SvcImpl: UinDraft
+    identity_service->>credential_request_generator: POST /credentialrequest/requestgenerator<br/>Credential request for each UIN/VID/handle per partner
+    activate credential_request_generator
+    credential_request_generator->>credential_request_generator: Entry created with status NEW<br/>in credential_transaction table
+    credential_request_generator-->>identity_service: Credential request accepted
+    deactivate credential_request_generator
 
-                loop For each UinBiometricDraft
-                    SvcImpl->>S3: deleteBiometricObject(uinHash, extractedFileName)<br/>[non-fatal, logs on failure]
-                    S3-->>SvcImpl: deleted (or warned)
-                    SvcImpl->>S3: getBiometricObject(uinHash, bioFileId)
-                    S3-->>SvcImpl: raw CBEFF bytes
-                    SvcImpl->>Proxy: getBiometricsForRequestedFormats(uinHash, bioFileId, formats, cbeff)
-                    Proxy-->>SvcImpl: extracted biometric bytes
-                    SvcImpl->>S3: store extracted result
-                    S3-->>SvcImpl: stored
-                end
+    identity_service->>identity_service: Status updated to REQUESTED<br/>in credential_request_status table
 
-                SvcImpl-->>CTRL: IdResponseDTO (status=DRAFTED)
-                CTRL-->>REST: HTTP 200
-                REST-->>BIO: success
-            end
+    %% ─────────────────────────────────────────────────────────────────
+    Note over credential_request_generator,websub: STEP 5: Credential Issuance
+    %% ─────────────────────────────────────────────────────────────────
 
-            BIO->>BIO: Set status = PROCESSING (success)
+    credential_request_generator->>credential_request_generator: CredentialProcess job runs
 
-            alt Error during extraction
-                BIO->>DraftSvc: idrepoDiscardDraft(regId)
-                DraftSvc->>REST: deleteApi(IDREPODISCARDDRAFT, [regId])
-                REST->>CTRL: DELETE /draft/discard/{regId}
-                CTRL->>SvcImpl: discardDraft(regId)
-                SvcImpl->>DB: uinDraftRepo.deleteByRegId(regId)
-                DB-->>SvcImpl: deleted
-                CTRL-->>REST: HTTP 200
-                REST-->>BIO: ok
-                BIO->>BIO: Set status = FAILED
-            end
-        end
-    end
+    credential_request_generator->>credential_service: POST /credentials/issue<br/>Credential issue request
+    activate credential_service
 
-    %% =================================================================
-    %% PHASE 3: Finalization Stage — publishDraft
-    %% =================================================================
-    rect rgb(230, 255, 235)
-        Note over FIN,VID: ③ FINALIZATION STAGE — publishDraft flow
+    credential_service->>data_share: Request datashare URL<br/>(demographic + biometric data)
+    activate data_share
+    data_share-->>credential_service: Datashare URL generated
+    deactivate data_share
 
-        FIN->>DraftSvc: idrepoHasDraft(regId)
-        DraftSvc->>REST: headApi(IDREPOHASDRAFT, [regId])
-        REST->>CTRL: HEAD /draft/{regId}
-        CTRL->>SvcImpl: hasDraft(regId)
-        SvcImpl->>DB: uinDraftRepo.existsByRegId(regId)
-        DB-->>SvcImpl: true/false
-        CTRL-->>REST: 200 / 204
-        REST-->>DraftSvc: 200 / 204
-        DraftSvc-->>FIN: true / false
+    credential_service->>websub: Publish credential event to IDA topic
+    activate websub
+    websub-->>credential_service: Event published successfully
+    deactivate websub
 
-        alt Draft NOT found (false)
-            FIN->>FIN: Set status = FAILED<br/>StatusUtil.FINALIZATION_DRAFT_REQUEST_UNAVAILABLE
-        else Draft found (true)
-            FIN->>DraftSvc: idrepoPublishDraft(regId)
-            DraftSvc->>REST: getApi(IDREPOPUBLISHDRAFT, [regId])
-            REST->>CTRL: GET /draft/publish/{regId}
-            CTRL->>SvcImpl: publishDraft(regId)
+    credential_service-->>credential_request_generator: Credential issued successfully
+    deactivate credential_service
 
-            SvcImpl->>DB: uinDraftRepo.findByRegId(regId)
-            DB-->>SvcImpl: UinDraft entity
+    credential_request_generator->>credential_request_generator: Status updated to ISSUED<br/>in credential_transaction table
 
-            SvcImpl->>SvcImpl: anonymousProfileHelper.setNewCbeff()
-            SvcImpl->>SvcImpl: buildRequest(regId, draft)<br/>parse uinData → IdRequestDTO<br/>remove verifiedAttributes from identity map
-            SvcImpl->>SvcImpl: validateRequest(request)
+    %% ─────────────────────────────────────────────────────────────────
+    Note over ida,websub: STEP 6: IDA Credential Processing
+    %% ─────────────────────────────────────────────────────────────────
 
-            SvcImpl->>DB: uinEncryptSaltRepo.getOne(saltId)
-            DB-->>SvcImpl: salt
-            SvcImpl->>SvcImpl: securityManager.decryptWithSalt(encryptedUin, salt)<br/>→ plain UIN string
+    ida-->>websub: Subscribes to UIN/VID credential events
+    websub-->>ida: Notifies credential event
 
-            SvcImpl->>UinDB: uinRepo.existsByUinHash(draft.uinHash)
-            UinDB-->>SvcImpl: true (update) / false (new)
+    ida->>ida: Stores event in credential_event_store table<br/>with status NEW
 
-            alt New Identity (UIN not yet in live table)
-                SvcImpl->>VID: vidDraftHelper.generateDraftVid(uin)
-                VID-->>SvcImpl: draftVid
-                SvcImpl->>SvcImpl: super.addIdentity(idRequest, uin)
-                Note over SvcImpl,INTC: IdRepoEntityInterceptor.onSave()<br/>encrypts uinData (AES) + uin (AES+Salt)<br/>before INSERT
-                SvcImpl->>UinDB: INSERT uin, uin_history [encrypted]
-                SvcImpl->>S3: store identity documents / biometrics
-                SvcImpl->>VID: vidDraftHelper.activateDraftVid(draftVid)
-                VID-->>SvcImpl: activated
-            else Existing Identity (update/correction)
-                SvcImpl->>SvcImpl: super.updateIdentity(idRequest, uin)
-                Note over SvcImpl,INTC: IdRepoEntityInterceptor.onFlushDirty()<br/>re-encrypts uinData + uin before UPDATE
-                SvcImpl->>UinDB: UPDATE uin, INSERT uin_history [encrypted]
-                SvcImpl->>S3: update changed documents / biometrics
-            end
+    ida->>ida: CredentialStoreJob runs
 
-            SvcImpl->>SvcImpl: anonymousProfileHelper.buildAndsaveProfile(true)
+    ida->>data_share: Download demographic + biometric data<br/>using datashare URL
+    activate data_share
+    data_share-->>ida: Data downloaded successfully
+    deactivate data_share
 
-            SvcImpl->>SvcImpl: publishDocuments(draft, uinObject)
-            SvcImpl->>DB: uinBiometricRepo.saveAll(biometrics from draft)
-            DB-->>SvcImpl: saved
-            SvcImpl->>DB: uinDocumentRepo.saveAll(documents from draft)
-            DB-->>SvcImpl: saved
+    ida->>ida: Re-encrypt data under IDA's key manager<br/>Store in identity_cache table<br/>Update credential_event_store status to STORED
 
-            SvcImpl->>DB: uinDraftRepo.deleteByRegId(regId)
-            DB-->>SvcImpl: draft deleted
+    %% ─────────────────────────────────────────────────────────────────
+    Note over ida,credential_request_generator: STEP 7: Acknowledgement
+    %% ─────────────────────────────────────────────────────────────────
 
-            SvcImpl-->>CTRL: IdResponseDTO (status = ACTIVATED / DEACTIVATED)
-            CTRL-->>REST: HTTP 200
-            REST-->>DraftSvc: IdResponseDTO
+    ida->>websub: Publish CREDENTIAL_STATUS_UPDATE event
+    activate websub
+    credential_request_generator-->>websub: Subscribes to callback events
+    websub-->>credential_request_generator: Notifies callback event
+    deactivate websub
 
-            alt publishDraft returned errors
-                alt Error code = IDR-IDS-003 (key manager error)
-                    DraftSvc-->>FIN: throw IdrepoDraftReprocessableException<br/>[packet retried — status = PROCESSING]
-                else Other error
-                    DraftSvc->>REST: deleteApi(IDREPODISCARDDRAFT, [regId])
-                    REST->>CTRL: DELETE /draft/discard/{regId}
-                    CTRL->>SvcImpl: discardDraft(regId)
-                    SvcImpl->>DB: uinDraftRepo.deleteByRegId(regId)
-                    DB-->>SvcImpl: deleted
-                    CTRL-->>REST: HTTP 200
-                    DraftSvc-->>FIN: throw IdrepoDraftException<br/>[packet FAILED]
-                end
-            else Publish success
-                DraftSvc-->>FIN: IdResponseDTO
-                FIN->>FIN: Set status = PROCESSING<br/>(pass to next stage)
-            end
-        end
-    end
-
-    %% =================================================================
-    %% PHASE 4: IDA Authentication Filter Chain (encrypt/decrypt layer)
-    %% =================================================================
-    rect rgb(245, 230, 255)
-        Note over UIN,VID: ④ IDA AUTH FILTER CHAIN — how auth requests are decrypted before reaching controller
-
-        participant AUTHCLIENT as Auth Partner / Client
-        participant IDAFILT as BaseIDAFilter→BaseAuthFilter<br/>→IdAuthFilter (IDA)
-        participant IDACTRL as AuthController<br/>(IDA)
-        participant IDACACHE as IdentityCache<br/>(IDA DB)
-
-        AUTHCLIENT->>IDAFILT: POST /auth/{mispLK}/{partnerId}/{apiKey}<br/>Headers: signature (JWS)<br/>Body: {id, version, request(encrypted+base64), requestSessionKey(RSA-encrypted), requestHMAC, thumbprint}
-
-        Note over IDAFILT: Step 1 — BaseIDAFilter<br/>Validate `id` field matches config<br/>Validate `version` format (regex)
-
-        Note over IDAFILT: Step 2 — BaseAuthFilter.authenticateRequest()<br/>keyManager.verifySignature(signature header)<br/>Validates RSA cert trust chain
-
-        Note over IDAFILT: Step 3 — IdAuthFilter.decipherRequest()<br/>decode(requestSessionKey) → encryptedSessionKey bytes<br/>keyManager.kernelDecryptAndDecode(thumbprint, encryptedSessionKey, encryptedHMAC, IDA_refId)<br/>→ RSA-decrypts session key with IDA private key<br/>→ AES-decrypts HMAC → validates integrity<br/>keyManager.requestData() → AES-decrypts `request` field<br/>→ replaces encrypted request with plain Map
-
-        Note over IDAFILT: Step 4 — decipherBioData() (if biometrics present)<br/>per segment: decode JWS payload → verify digitalId signature<br/>compute salt = Base64(XOR(timestamp,txnId)[-2:bytes])<br/>compute aad  = Base64(XOR(timestamp,txnId)[-3:bytes])<br/>keyManager.kernelDecrypt(thumbprint, encBioSessionKey, encBioValue, BIO_refId, aad, salt)<br/>→ AES-GCM decrypts each Biometric Data Block (BDB)
-
-        Note over IDAFILT: Step 5 — IdAuthFilter.validateDecipheredRequest()<br/>partnerService.validateAndGetPolicy(partnerId)<br/>checkMispPolicyAllowed(), checkAllowedAuthTypeBasedOnPolicy()<br/>addMetadata(partnerId, partnerPolicy) to request map
-
-        IDAFILT->>IDACTRL: decrypted plain-text request Map
-        IDACTRL->>IDACACHE: fetch identity by idHash
-        IDACACHE-->>IDACTRL: demographicData + biometricData (plain)
-        IDACTRL-->>IDAFILT: authentication result (JSON)
-
-        Note over IDAFILT: consumeResponse()<br/>keyManager.signResponse(responseAsString)<br/>→ signs with IDA private key (JWS)<br/>→ sets `response-signature` HTTP header
-
-        IDAFILT-->>AUTHCLIENT: HTTP 200 JSON + response-signature header
-    end
+    credential_request_generator->>credential_request_generator: Status updated to STORED<br/>in credential_transaction table
